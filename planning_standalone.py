@@ -34,6 +34,7 @@ import os
 import re
 import sys
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
@@ -122,6 +123,7 @@ PLAN_JSON_SCHEMA: dict = {
 @dataclass
 class ToolMetrics:
     """Track performance of individual tools."""
+
     name: str
     call_count: int = 0
     loop_count: int = 0  # times this tool contributed to loop
@@ -142,7 +144,9 @@ class PlannerConfig:
         default_factory=lambda: os.getenv("PLANNER_MODEL", "gpt-4o-mini")
     )
     api_url: str = field(
-        default_factory=lambda: os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        default_factory=lambda: os.getenv(
+            "OPENAI_BASE_URL", "https://api.openai.com/v1"
+        )
     )
     api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     temperature: float = 0.7
@@ -159,6 +163,10 @@ class PlannerConfig:
     execution_params: dict = field(default_factory=dict)
     synthesis_params: dict = field(default_factory=dict)
     plan_mode: bool = True
+    # When plan_mode is on, still skip planning and answer in a single pass for
+    # short/simple requests (heuristic below) instead of always decomposing.
+    auto_skip_plan_for_short_tasks: bool = True
+    short_task_max_words: int = 20
     max_tasks: int = 20
     task_result_limit: int = 6000
     enable_review: bool = False
@@ -179,6 +187,65 @@ class PlannerConfig:
     warn_at_percent: float = 0.8
     # Resume from memory
     enable_memory_resume: bool = True
+    # Kev (System One) decisions. Empty URL = off, and every call falls back to the
+    # behaviour below it. See KevClient for why these three calls and not others.
+    kev_url: str = field(default_factory=lambda: os.getenv("KEV_URL", ""))
+    kev_api_key: str = field(default_factory=lambda: os.getenv("KEV_API_KEY", ""))
+    kev_timeout: float = 30.0
+    kev_state_limit: int = (
+        4000  # characters of a task result or draft Kev is asked to judge
+    )
+    # Kev reads the request once, before anything is generated, and answers three questions in one pass:
+    #   1. is it simple?          -> answer in one pass instead of decomposing (replaces the word-count heuristic)
+    #   2. does it need thinking? -> no: the model's reasoning is switched off for every phase ("think": false)
+    #   3. artistic or scientific -> sets the base temperature (explicit per-phase temperatures still win)
+    kev_decide_planning: bool = True
+    kev_simple_threshold: float = 0.4
+    kev_classify_request: bool = True
+    kev_think_threshold: float = 0.5
+    kev_artistic_threshold: float = 0.5
+    kev_artistic_temperature: float = 1.0
+    kev_scientific_temperature: float = 0.3
+    # Offer the MCP tools only when the request needs them (a tool-calling loop is a generation per round).
+    kev_ask_tools: bool = True
+    kev_tools_threshold: float = 0.5
+    # Fast paths. With Kev served through Ollama every question is its own ~0.55 s call (they are neither batched
+    # nor faster concurrently, measured 2026-09-22), so the profile asks only what can still change the run:
+    # greetings skip Kev entirely, a repeated request (regenerate) reuses its answers, the thinking question is not
+    # asked of an artistic request (poem 0.004, fantasy 0.028, brainstorm 0.013) or of a model that cannot think,
+    # the tools question only when tools exist, the temperature question only when a phase would use it.
+    fast_small_talk: bool = True
+    small_talk_max_words: int = 6
+    kev_cache_size: int = 128
+    model_can_think: Optional[bool] = (
+        None  # None = unknown (ask); the pipe reads it from Ollama
+    )
+    # With thinking on, only the execution phase thinks: the plan is JSON and the synthesis merges finished results,
+    # so reasoning there is tokens spent before the first useful one.
+    think_in_planning: bool = False
+    # A plan of one task already produced the answer; the synthesis pass would only rewrite it.
+    skip_single_task_synthesis: bool = True
+    # Tell the one-pass answer to a simple request to skip preamble and restating the question.
+    direct_answer_hint: bool = True
+    # After each task, ask whether the result carries out the task; retry if not.
+    kev_check_tasks: bool = True
+    kev_accept_threshold: float = 0.25
+    # Run the review pass only when the draft needs it (overrides enable_review when Kev answers).
+    kev_gate_review: bool = True
+    kev_review_threshold: float = 0.05
+    # The two low thresholds are deliberate, and measured rather than guessed (qwen3.8-27B IQ2_M through Ollama,
+    # 2026-09-22). A plain base model's probabilities are uncalibrated - the ordering is reliable, the level moves with
+    # the wording - and both errors here are asymmetric: a wrong "retry" or a wrong "review" costs a whole generation,
+    # while a wrong "accept" only leaves the behaviour the planner had before Kev. So both act only on a confident no.
+    #   task check    good result 0.791 / empty waffle 0.000                  -> 0.25 separates with room either side
+    #   review gate   complete 0.998 and 0.316 / vague 0.009 / partial 0.000  -> 0.05 reviews only the clear failures
+    #   simple        capital city 0.985, greeting 0.933, sky 0.607 / train sum 0.485, proof 0.093,
+    #                 four-part analysis 0.000                                 -> 0.4 answers a one-shot sum in one pass
+    #   think         proof 0.906, train sum 0.982, code fix 0.703 / analysis 0.184, poem 0.004, capital 0.012 -> 0.5
+    #   artistic      poem, fantasy world, brainstorm 1.000 / greeting 0.100, everything factual <= 0.043     -> 0.5
+    #   tools         weather now, exchange rate, web search, "what did I tell you" 0.964-0.998 /
+    #                 capital, poem, proof, code fix <= 0.034                                                -> 0.5
+    # Re-measure these against any other model before trusting them.
 
 
 @dataclass
@@ -421,6 +488,111 @@ def _mcp_result_to_text(result: Any, limit: int = 4000) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# Kev: typed decisions instead of generated judgement
+# ---------------------------------------------------------------------------
+
+
+# Kev's answers per (endpoint, request), so a regenerate or a resent message pays nothing for its profile.
+_KEV_PROFILE_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+
+# Every word of the message has to be one of these for it to count as small talk: "hi, what is 2+2" is a question.
+_SMALL_TALK_WORDS = frozenset("""
+    hi hey hello hallo servus moin griaß grüß gruess gott di dich good morning afternoon evening night guten morgen
+    abend tag thanks thank you thx ty danke dank vielen schön schoen sehr very much ok okay k cool nice great super
+    perfect perfekt passt alright fine bye tschüss tschuess ciao baba how are wie geht's gehts es dir there all
+    everyone zusammen leute mate
+""".split())
+
+
+class KevClient:
+    """Yes/no decisions from a Kev System One endpoint (POST /v1/systemone).
+
+    Three of the planner's judgement calls are not writing tasks at all - is this request worth decomposing, did this
+    task actually produce what it was asked for, does the draft need another pass. Asking the planning model costs a
+    full generation and comes back as prose to be parsed; Kev scores the two options against the model's next-token
+    logits and answers in about 0.2 s with a probability, using the same weights the chat model is already holding.
+
+    Every call is fail-open: a missing URL, an unreachable endpoint or a malformed answer returns None, and the caller
+    keeps the behaviour it had before Kev existed. The probabilities are uncalibrated (no fitted temperature exists for
+    a plain base model), so they are used as thresholds to choose between two code paths, never reported as a number
+    the user should trust.
+    """
+
+    def __init__(self, url: str = "", api_key: str = "", timeout: float = 30.0):
+        self.url = (url or "").rstrip("/")
+        self.api_key = api_key
+        self.timeout = timeout
+        self.calls = 0
+        self.failures = 0
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.url)
+
+    async def noul(
+        self, state: str, question: str, criteria: Optional[dict] = None
+    ) -> Optional[float]:
+        """p(true) for one yes/no question about `state`, or None when Kev did not answer."""
+        answers = await self.nouls(state, {"q": (question, criteria)})
+        return answers.get("q") if answers else None
+
+    async def nouls(self, state: str, questions: dict) -> Optional[dict]:
+        """p(true) for several yes/no questions about the same `state` in one request ({id: (question, criteria)}),
+        or None when Kev did not answer. One prefill of the state serves every question.
+        """
+        if not self.enabled or not state.strip() or not questions:
+            return None
+        payload = {
+            "state": state,
+            "model": "kev-latest",
+            "questions": {
+                qid: {
+                    "type": "noul",
+                    "instructions": question,
+                    **({"criteria": criteria} if criteria else {}),
+                }
+                for qid, (question, criteria) in questions.items()
+            },
+        }
+        try:
+            body = await asyncio.to_thread(self._post, payload)
+            self.calls += 1
+            return {qid: float(body["answers"][qid]["noul"]) for qid in questions}
+        except Exception:  # noqa: BLE001 - never let a decision service break the run
+            self.failures += 1
+            return None
+
+    def _post(self, payload: dict) -> dict:
+        import urllib.request
+
+        headers = {"content-type": "application/json"}
+        if self.api_key:
+            headers["authorization"] = f"Bearer {self.api_key}"
+        request = urllib.request.Request(
+            f"{self.url}/v1/systemone",
+            data=json.dumps(payload).encode(),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            return json.loads(response.read())
+
+
+def _check_reachable(url: str, timeout: float = 2.0) -> None:
+    import socket
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    try:
+        socket.create_connection(
+            (parts.hostname or "localhost", port), timeout=timeout
+        ).close()
+    except OSError as exc:
+        raise ConnectionError(f"{parts.hostname}:{port} not reachable ({exc})") from exc
+
+
 class MCPClient:
     """Connects to one or more MCP servers and exposes their tools.
 
@@ -475,6 +647,10 @@ class MCPClient:
         from mcp import ClientSession
 
         transport = (srv.get("transport") or "streamable-http").lower()
+        if transport in ("streamable-http", "http", "streamable_http", "sse"):
+            # A refused connection inside the MCP client's task group surfaces as a CancelledError that tears down the
+            # whole run instead of skipping this server. Refuse early, as an ordinary error the caller notes.
+            await asyncio.to_thread(_check_reachable, srv["url"])
         if transport in ("streamable-http", "http", "streamable_http"):
             from mcp.client.streamable_http import streamablehttp_client
 
@@ -585,6 +761,16 @@ class StandalonePlanner:
         self._tool_metrics: dict[str, ToolMetrics] = {}
         # Track previous attempt results for divergence checking
         self._prev_attempt_results: dict[str, str] = {}
+        # Typed decisions (off when no URL is configured; every call falls back)
+        self.kev = KevClient(config.kev_url, config.kev_api_key, config.kev_timeout)
+        # What Kev made of the request (set by _profile_request; None = no answer, keep the configured behaviour)
+        self._p_simple: Optional[float] = None
+        self._think: Optional[bool] = None
+        self._temperature: float = self.config.temperature
+        self._tools_wanted: Optional[bool] = (
+            None  # False = keep the tools away from the model for this request
+        )
+        self._direct: bool = False  # simple request: answer without preamble
 
     async def _emit(self, message: str) -> None:
         if self._progress is not None:
@@ -604,7 +790,17 @@ class StandalonePlanner:
         if self.config.planning_temperature is not None:
             return self.config.planning_temperature
         # Default: keep planning deterministic regardless of the base temperature.
-        return min(self.config.temperature, 0.4)
+        return min(self._temperature, 0.4)
+
+    def _execution_temperature(self) -> float:
+        if self.config.execution_temperature is not None:
+            return self.config.execution_temperature
+        return self._temperature
+
+    def _synthesis_temperature(self) -> float:
+        if self.config.synthesis_temperature is not None:
+            return self.config.synthesis_temperature
+        return self._temperature
 
     def _phase_params(self, phase: str) -> Optional[dict]:
         """Merge base sampling params with this phase's overrides."""
@@ -614,11 +810,18 @@ class StandalonePlanner:
             "synthesis": self.config.synthesis_params,
         }.get(phase) or {}
         merged = {**(self.config.sampling_params or {}), **override}
+        think_here = self._think
+        if think_here and phase != "execution" and not self.config.think_in_planning:
+            think_here = False
+        if think_here is False and "think" not in merged:
+            # Only ever switch reasoning off: "think": true is an error on a model without it, and a thinking model
+            # already thinks by default. The backends translate this key for their API.
+            merged["think"] = False
         return merged or None
 
     def _adjusted_temperature(self, attempt: int) -> Optional[float]:
         """Increase temperature on retry to escape loops (exponential backoff)."""
-        base = self.config.execution_temperature or self.config.temperature
+        base = self._execution_temperature()
         if attempt <= 0:
             return base
         # Exponential: 1.1x, 1.3x, 1.6x → smoother curve
@@ -639,7 +842,7 @@ class StandalonePlanner:
         return adjusted or None
 
     def _available_tool_names(self) -> list[str]:
-        if self._mcp is None:
+        if self._mcp is None or self._tools_wanted is False:
             return []
         try:
             return list(self._mcp.tool_names)
@@ -834,7 +1037,7 @@ class StandalonePlanner:
 
     def _tools_catalog_text(self) -> str:
         """Human-readable catalog of available tools for the planning prompt."""
-        if self._mcp is None:
+        if self._mcp is None or self._tools_wanted is False:
             return ""
         try:
             schemas = self._mcp.openai_tools()
@@ -926,7 +1129,9 @@ class StandalonePlanner:
             await self._emit(f"Plan ready: {len(tasks)} task(s)")
         return tasks
 
-    async def execute_task(self, goal: str, task: Task, done: dict[str, Task], attempt: int = 0) -> str:
+    async def execute_task(
+        self, goal: str, task: Task, done: dict[str, Task], attempt: int = 0
+    ) -> str:
         await self._emit(f"Executing {task.task_id}: {task.description[:60]}")
 
         if task.related_tasks:
@@ -939,7 +1144,9 @@ class StandalonePlanner:
             for dep in deps
             if dep.status == "completed" and dep.result
         ]
-        context = "\n\n".join(context_blocks) if context_blocks else "(no prior results)"
+        context = (
+            "\n\n".join(context_blocks) if context_blocks else "(no prior results)"
+        )
 
         user_message = (
             f"Original user request:\n{goal}\n\n"
@@ -995,7 +1202,7 @@ class StandalonePlanner:
 
     def _select_tools(self, names: list[str]) -> list[dict]:
         """Return the OpenAI tool schemas matching `names` (planner's selection)."""
-        if self._mcp is None or not names:
+        if self._mcp is None or not names or self._tools_wanted is False:
             return []
         try:
             by_name = {
@@ -1006,7 +1213,9 @@ class StandalonePlanner:
             return []
         return [by_name[n] for n in names if n in by_name]
 
-    async def _execute_with_tools(self, user_message: str, tools: list[dict], attempt: int = 0) -> str:
+    async def _execute_with_tools(
+        self, user_message: str, tools: list[dict], attempt: int = 0
+    ) -> str:
         """Run one task as a tool-calling loop over the configured MCP tools."""
         messages: list[dict] = [
             {
@@ -1024,7 +1233,9 @@ class StandalonePlanner:
         # On retry: disable problematic tools based on metrics, or all tools on 3rd+
         use_tools = tools
         if attempt >= 2:
-            await self._emit(f"  ↳ attempt {attempt}: tools disabled, forcing reasoning-only")
+            await self._emit(
+                f"  ↳ attempt {attempt}: tools disabled, forcing reasoning-only"
+            )
             use_tools = []
         elif attempt == 1:
             # Filter out tools that caused loops in previous attempts
@@ -1034,7 +1245,9 @@ class StandalonePlanner:
                 if metrics.loop_count > 0
             ]
             if problematic:
-                await self._emit(f"  ↳ disabling problematic tools: {', '.join(problematic)}")
+                await self._emit(
+                    f"  ↳ disabling problematic tools: {', '.join(problematic)}"
+                )
                 use_tools = [
                     t
                     for t in tools
@@ -1057,11 +1270,15 @@ class StandalonePlanner:
                 return assistant_turn["content"]
 
             for call in tool_calls:
-                fn = (call.get("function") or {})
+                fn = call.get("function") or {}
                 name = fn.get("name") or ""
                 raw_args = fn.get("arguments")
                 try:
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                    args = (
+                        json.loads(raw_args)
+                        if isinstance(raw_args, str)
+                        else (raw_args or {})
+                    )
                     if not isinstance(args, dict):
                         args = {}
                 except json.JSONDecodeError:
@@ -1097,7 +1314,8 @@ class StandalonePlanner:
     async def synthesize(self, goal: str, tasks: list[Task]) -> str:
         await self._emit("Synthesizing final answer...")
         results_block = "\n\n".join(
-            f"--- {t.task_id} ({t.status}) ---\n{self._truncate(t.result)}" for t in tasks
+            f"--- {t.task_id} ({t.status}) ---\n{self._truncate(t.result)}"
+            for t in tasks
         )
 
         # Inject time context
@@ -1112,7 +1330,7 @@ class StandalonePlanner:
         draft = await self.complete(
             PromptBuilder.synthesis_prompt(self.system_prompt),
             user_message,
-            self.config.synthesis_temperature,
+            self._synthesis_temperature(),
             False,
             self._phase_params("synthesis"),
         )
@@ -1121,7 +1339,17 @@ class StandalonePlanner:
         # Normalize abbreviations
         final = self._normalize_abbreviations(final)
 
-        if self.config.enable_review:
+        review = self.config.enable_review
+        needs_review = await self._draft_needs_review(goal, final)
+        if needs_review is not None:  # Kev answered: it decides, in both directions
+            if review != needs_review:
+                await self._emit(
+                    f"Kev: review = {str(needs_review).lower()} (draft judged "
+                    f"{'incomplete' if needs_review else 'complete'})"
+                )
+            review = needs_review
+
+        if review:
             await self._emit("Reviewing final answer...")
             final = await self.complete(
                 PromptBuilder.review_prompt(self.system_prompt),
@@ -1129,7 +1357,7 @@ class StandalonePlanner:
                 f"Original user request:\n{goal}\n\n"
                 f"Draft final answer:\n{final}\n\n"
                 "Return the improved final answer. Ensure all abbreviations are expanded to full words.",
-                self.config.synthesis_temperature,
+                self._synthesis_temperature(),
                 False,
                 self._phase_params("synthesis"),
             )
@@ -1149,6 +1377,230 @@ class StandalonePlanner:
 
         return re.sub(r"@([A-Za-z0-9_\-]+)", repl, text)
 
+    _MULTI_STEP_MARKERS = re.compile(
+        r"\b(then|after that|step\s*\d|also|additionally|as well as|"
+        r"followed by|first.*then)\b",
+        re.IGNORECASE,
+    )
+    _LIST_ITEM_RE = re.compile(r"(^|\n)\s*(\d+[.)]|[-*])\s+\S")
+
+    def _looks_like_short_task(self, goal: str) -> bool:
+        """Heuristic: is this simple enough to answer directly, no plan needed?
+
+        Short, single-sentence requests with no multi-step language or list
+        structure are treated as trivial. Anything longer or that signals
+        multiple deliverables still goes through planning.
+        """
+        text = goal.strip()
+        if not text:
+            return True
+        if len(text.split()) > self.config.short_task_max_words:
+            return False
+        if len(re.findall(r"[.!?]+", text)) > 1:
+            return False
+        if self._MULTI_STEP_MARKERS.search(text):
+            return False
+        if self._LIST_ITEM_RE.search(text):
+            return False
+        return True
+
+    # -- decisions ---------------------------------------------------------
+
+    def _kev_state(self, text: str) -> str:
+        """A task result or draft, cut to what is worth prefilling for one yes/no question."""
+        limit = self.config.kev_state_limit
+        if len(text) <= limit:
+            return text
+        head = limit // 2
+        return f"{text[:head]}\n\n...[truncated]...\n\n{text[-(limit - head):]}"
+
+    def _is_small_talk(self, goal: str) -> bool:
+        """A greeting, a thanks, an ok: nothing to plan, think about or look up, and not worth a Kev call."""
+        words = re.findall(r"[^\W\d_]+(?:'[^\W\d_]+)?", goal.lower())
+        if not (
+            self.config.fast_small_talk
+            and words
+            and len(words) <= self.config.small_talk_max_words
+        ):
+            return False
+        # Digits, code, or anything but words and light punctuation: not small talk.
+        if re.search(r"[0-9=+*/<>{}\[\]`$%]", goal):
+            return False
+        return all(w in _SMALL_TALK_WORDS for w in words)
+
+    async def _kev_answers(self, goal: str, questions: dict) -> dict:
+        """Kev's p(true) for `questions`, from the cache where this request was already asked."""
+        key = (self.kev.url, goal)
+        cached = _KEV_PROFILE_CACHE.get(key, {})
+        missing = {qid: q for qid, q in questions.items() if qid not in cached}
+        if missing:
+            fresh = await self.kev.nouls(goal, missing)
+            if fresh:
+                cached = {**cached, **fresh}
+                _KEV_PROFILE_CACHE[key] = cached
+                while len(_KEV_PROFILE_CACHE) > max(0, self.config.kev_cache_size):
+                    _KEV_PROFILE_CACHE.popitem(last=False)
+        if key in _KEV_PROFILE_CACHE:
+            _KEV_PROFILE_CACHE.move_to_end(key)
+        return {qid: cached[qid] for qid in questions if qid in cached}
+
+    async def _profile_request(self, goal: str, tools_available: bool = False) -> None:
+        """Before anything is generated: is the request simple, does it need tools, is it artistic or scientific,
+        does it need thinking. Asked in two rounds so an answer can make a later question unnecessary; each answer
+        that does not come back leaves the configured behaviour in place."""
+        cfg = self.config
+        if self._is_small_talk(goal):
+            self._p_simple, self._think, self._tools_wanted, self._direct = (
+                1.0,
+                False,
+                False,
+                True,
+            )
+            await self._emit(
+                "Small talk: answering directly (no Kev, no plan, no tools, no thinking)"
+            )
+            return
+        if not self.kev.enabled:
+            return
+        began = time.monotonic()
+
+        first: dict = {}
+        if (
+            cfg.plan_mode
+            and cfg.auto_skip_plan_for_short_tasks
+            and cfg.kev_decide_planning
+        ):
+            first["simple"] = (
+                "Is this a simple request that one short, direct answer covers?",
+                {
+                    "true": "a single direct answer covers it",
+                    "false": "it needs several steps or a long piece of work",
+                },
+            )
+        temperature_matters = (
+            cfg.execution_temperature is None or cfg.synthesis_temperature is None
+        )
+        if cfg.kev_classify_request and temperature_matters:
+            first["artistic"] = (
+                "Is this request artistic or creative rather than scientific or factual?",
+                {
+                    "true": "creative writing, art, storytelling, brainstorming, style",
+                    "false": "facts, science, math, code, analysis, precise instructions",
+                },
+            )
+        if cfg.kev_ask_tools and tools_available:
+            first["tools"] = (
+                "Does answering this need a tool: looking something up online, current or live information, "
+                "the user's files, saved memory, or an action outside this conversation?",
+                {
+                    "true": "it needs information or actions the model does not have",
+                    "false": "the model can answer it from what it knows",
+                },
+            )
+        answers = await self._kev_answers(goal, first) if first else {}
+        artistic = (
+            answers["artistic"] >= cfg.kev_artistic_threshold
+            if "artistic" in answers
+            else None
+        )
+
+        verdicts = []
+        if cfg.kev_classify_request and cfg.model_can_think is not False:
+            if artistic:
+                self._think = False
+                verdicts.append("thinking = off (artistic)")
+            else:
+                answers.update(
+                    await self._kev_answers(
+                        goal,
+                        {
+                            "think": (
+                                "Does answering this correctly require careful step-by-step reasoning?",
+                                {
+                                    "true": "it needs working out: logic, math, analysis, planning or code",
+                                    "false": "it can be answered from knowledge or by writing directly",
+                                },
+                            )
+                        },
+                    )
+                )
+        elif cfg.model_can_think is False:
+            verdicts.append("thinking = n/a (model cannot think)")
+
+        if "simple" in answers:
+            self._p_simple = answers["simple"]
+            self._direct = self._p_simple >= cfg.kev_simple_threshold
+            verdicts.insert(
+                0, f"simple = {str(self._direct).lower()} (p {self._p_simple:.3f})"
+            )
+        if "tools" in answers:
+            self._tools_wanted = answers["tools"] >= cfg.kev_tools_threshold
+            verdicts.append(
+                f"tools = {'on' if self._tools_wanted else 'off'} (p {answers['tools']:.3f})"
+            )
+        if "think" in answers:
+            self._think = answers["think"] >= cfg.kev_think_threshold
+            verdicts.append(
+                f"thinking = {'on' if self._think else 'off'} (p {answers['think']:.3f})"
+            )
+        if artistic is not None:
+            self._temperature = (
+                cfg.kev_artistic_temperature
+                if artistic
+                else cfg.kev_scientific_temperature
+            )
+            verdicts.append(
+                f"{'artistic' if artistic else 'scientific'} -> temperature {self._temperature:g} "
+                f"(p {answers['artistic']:.3f})"
+            )
+        if verdicts:
+            await self._emit(
+                f"Kev ({time.monotonic() - began:.1f} s): " + " · ".join(verdicts)
+            )
+
+    async def _should_skip_planning(self, goal: str) -> bool:
+        """Answer in one pass instead of decomposing? Kev's p(simple) decides when it answered; the word-count
+        heuristic decides when it did not. The heuristic mistakes a short hard request ("compare these three vendors on
+        price, support and lock-in") for a trivial one, and a long easy one for work."""
+        if not (self.config.plan_mode and self.config.auto_skip_plan_for_short_tasks):
+            return False
+        if self._p_simple is None:
+            return self._looks_like_short_task(goal)
+        return self._p_simple >= self.config.kev_simple_threshold
+
+    async def _task_result_is_usable(self, task: Task) -> Optional[bool]:
+        """Did the task actually produce what it was asked for? None when Kev did not answer, and then nothing
+        changes: loop detection stays the only check, as it was before."""
+        if not (self.config.kev_check_tasks and task.result.strip()):
+            return None
+        probability = await self.kev.noul(
+            f"TASK:\n{task.description}\n\nRESULT:\n{self._kev_state(task.result)}",
+            "Does the result contain the deliverable the task asked for?",
+            {
+                "true": "the asked-for content is present",
+                "false": "it is generic, partial or about something else",
+            },
+        )
+        if probability is None:
+            return None
+        return probability >= self.config.kev_accept_threshold
+
+    async def _draft_needs_review(self, goal: str, draft: str) -> Optional[bool]:
+        """Whether the review pass is worth its generation. None when Kev did not answer."""
+        if not self.config.kev_gate_review:
+            return None
+        probability = await self.kev.noul(
+            f"REQUEST:\n{goal}\n\nDRAFT ANSWER:\n{self._kev_state(draft)}",
+            "Does the draft address everything the request asked for?",
+            {
+                "true": "every part of the request is covered",
+                "false": "part of the request is not covered",
+            },
+        )
+        if probability is None:
+            return None
+        return probability < self.config.kev_review_threshold
+
     # -- orchestration -----------------------------------------------------
 
     def _make_mcp(self) -> Any:
@@ -1159,46 +1611,76 @@ class StandalonePlanner:
 
     async def run(self, goal: str) -> PlannerResult:
         start = time.monotonic()
-        async with self._make_mcp() as mcp:
-            self._mcp = mcp
-            for note in getattr(mcp, "notes", []) or []:
-                await self._emit(note)
-            tool_names = mcp.tool_names
-            configured = bool(self.config.mcp_servers)
-            if tool_names:
-                # List every discovered tool up front so the user can see the
-                # full toolset the planner may draw from.
-                await self._emit(
-                    f"MCP ready: {len(tool_names)} tool(s) found — "
-                    + ", ".join(tool_names)
-                )
-                catalog = self._tools_catalog_text()
-                if catalog:
-                    await self._emit("Available MCP tools:\n" + catalog)
-            elif configured:
-                # Servers were configured but no tools were discovered: tell the
-                # user explicitly instead of failing silently.
-                await self._emit(
-                    "MCP enabled but no tools were found (check the server URL / "
-                    "that it is running and exposes tools)."
-                )
-            elif self.chat is not None:
-                # No servers configured at all (e.g. MCP disabled).
-                await self._emit("MCP not configured — running without tools.")
-            try:
-                return await self._run_inner(goal, start)
-            finally:
-                self._mcp = None
+        # Kev's profile runs while the MCP servers connect (both mostly wait on I/O). The MCP context stays in this
+        # task: its anyio scopes must be entered and left in the same one.
+        tools_possible = bool(self.config.mcp_servers) and self.chat is not None
+        profile = asyncio.create_task(
+            self._profile_request(goal, tools_available=tools_possible)
+        )
+        await asyncio.sleep(
+            0
+        )  # let the Kev request start before the MCP import (~3 s the first time) holds the loop
+        mcp_cm = _NullMCP() if self._is_small_talk(goal) else self._make_mcp()
+        try:
+            async with mcp_cm as mcp:
+                await profile
+                return await self._run_connected(mcp, goal, start)
+        finally:
+            if not profile.done():
+                profile.cancel()
+
+    async def _run_connected(self, mcp: Any, goal: str, start: float) -> PlannerResult:
+        self._mcp = mcp
+        for note in getattr(mcp, "notes", []) or []:
+            await self._emit(note)
+        tool_names = mcp.tool_names
+        configured = bool(self.config.mcp_servers)
+        if tool_names:
+            # List every discovered tool up front so the user can see the
+            # full toolset the planner may draw from.
+            await self._emit(
+                f"MCP ready: {len(tool_names)} tool(s) found — " + ", ".join(tool_names)
+            )
+            catalog = self._tools_catalog_text()
+            if catalog:
+                await self._emit("Available MCP tools:\n" + catalog)
+        elif configured:
+            # Servers were configured but no tools were discovered: tell the
+            # user explicitly instead of failing silently.
+            await self._emit(
+                "MCP enabled but no tools were found (check the server URL / "
+                "that it is running and exposes tools)."
+            )
+        elif self.chat is not None:
+            # No servers configured at all (e.g. MCP disabled).
+            await self._emit("MCP not configured — running without tools.")
+        try:
+            return await self._run_inner(goal, start)
+        finally:
+            self._mcp = None
 
     async def _run_inner(self, goal: str, start: float) -> PlannerResult:
-        if not self.config.plan_mode:
+        skip_plan = not self.config.plan_mode
+        if not skip_plan and await self._should_skip_planning(goal):
+            await self._emit("Short/simple request — skipping planning")
+            skip_plan = True
+
+        if skip_plan:
             await self._emit("Single-pass execution (plan mode off)")
             single = Task(task_id="task_1", description=goal)
-            tools = self._mcp.openai_tools() if self._mcp is not None else []
+            tools = (
+                self._mcp.openai_tools()
+                if self._mcp is not None and self._tools_wanted is not False
+                else []
+            )
 
             # Inject time context
             time_context = self._get_current_time_context()
             user_message = f"{time_context}\n\nUser request:\n{goal}"
+            if self._direct and self.config.direct_answer_hint:
+                user_message += (
+                    "\n\nAnswer directly: no preamble, do not restate the request."
+                )
 
             if tools and self.chat is not None:
                 single.result = await self._execute_with_tools(user_message, tools)
@@ -1206,7 +1688,7 @@ class StandalonePlanner:
                 single.result = await self.complete(
                     PromptBuilder.execution_prompt(self.system_prompt),
                     user_message,
-                    self.config.execution_temperature,
+                    self._execution_temperature(),
                     False,
                     self._phase_params("execution"),
                 )
@@ -1241,9 +1723,8 @@ class StandalonePlanner:
                     # Check for repetition loop
                     if self._is_looping(task.result, "execution"):
                         # Verify it's not just noise—output must diverge from previous
-                        if (
-                            prev_result
-                            and not self._diverges_from_previous(task.result, prev_result)
+                        if prev_result and not self._diverges_from_previous(
+                            task.result, prev_result
                         ):
                             await self._emit(
                                 f"{task.task_id}: retry produced same output, aborting"
@@ -1264,7 +1745,19 @@ class StandalonePlanner:
                                 self._tool_metrics[tool].loop_count += 1
                             continue
                         else:
-                            await self._emit(f"{task.task_id}: loop persisted; accepting result")
+                            await self._emit(
+                                f"{task.task_id}: loop persisted; accepting result"
+                            )
+                    if (
+                        attempt < max_attempts - 1
+                        and await self._task_result_is_usable(task) is False
+                    ):
+                        await self._emit(
+                            f"{task.task_id}: Kev says the result does not carry out the task; "
+                            f"retrying (attempt {attempt + 1}/{max_attempts - 1})"
+                        )
+                        prev_result = task.result
+                        continue
                     break  # success or final attempt; exit retry loop
                 task.status = "completed"
             except Exception as exc:  # keep going; record the failure
@@ -1273,6 +1766,17 @@ class StandalonePlanner:
                 await self._emit(f"{task.task_id} failed: {exc}")
             done[task.task_id] = task
 
+        if (
+            self.config.skip_single_task_synthesis
+            and len(tasks) == 1
+            and len(done) == 1
+            and tasks[0].status == "completed"
+            and tasks[0].result.strip()
+        ):
+            await self._emit(
+                "One-task plan: its result is the answer (synthesis skipped)"
+            )
+            return PlannerResult(goal, tasks, tasks[0].result, time.monotonic() - start)
         final_output = await self.synthesize(goal, tasks)
         return PlannerResult(goal, tasks, final_output, time.monotonic() - start)
 
@@ -1298,6 +1802,21 @@ _OPENAI_STD_PARAMS = {
     "logprobs",
     "top_logprobs",
 }
+
+
+def _openai_think_fields(params: Optional[dict]) -> Optional[dict]:
+    """Translate the planner's backend-neutral {"think": False} for an OpenAI-compatible API.
+
+    Ollama's /v1 ignores "think" and honours reasoning_effort "none" (measured on 0.34.2); llama.cpp and vLLM read
+    chat_template_kwargs. Each server ignores the field meant for the other.
+    """
+    if not params or "think" not in params:
+        return params
+    params = dict(params)
+    if params.pop("think") is False:
+        params.setdefault("reasoning_effort", "none")
+        params.setdefault("chat_template_kwargs", {"enable_thinking": False})
+    return params or None
 
 
 def make_openai_completer(config: PlannerConfig) -> CompletionFn:
@@ -1330,7 +1849,7 @@ def make_openai_completer(config: PlannerConfig) -> CompletionFn:
             }
             # Route standard params as kwargs; everything else via extra_body.
             extra_body: dict = {}
-            for key, value in (params or {}).items():
+            for key, value in (_openai_think_fields(params) or {}).items():
                 if value is None:
                     continue
                 if key in _OPENAI_STD_PARAMS:
@@ -1384,7 +1903,7 @@ def make_openai_chat(config: PlannerConfig) -> ChatFn:
                 ),
             }
             extra_body: dict = {}
-            for key, value in (params or {}).items():
+            for key, value in (_openai_think_fields(params) or {}).items():
                 if value is None:
                     continue
                 if key in _OPENAI_STD_PARAMS:
@@ -1489,7 +2008,11 @@ def _owui_debug_body(response: Any) -> str:
     body = getattr(response, "body", None)
     if body is not None:
         try:
-            return body.decode("utf-8", "replace") if isinstance(body, (bytes, bytearray)) else str(body)
+            return (
+                body.decode("utf-8", "replace")
+                if isinstance(body, (bytes, bytearray))
+                else str(body)
+            )
         except Exception:
             return repr(body)
     return repr(response)
@@ -1509,7 +2032,9 @@ def _owui_extract_content(response: Any) -> str:
             return _content_from_choices(json.loads(body))
         except Exception:
             try:
-                return body.decode() if isinstance(body, (bytes, bytearray)) else str(body)
+                return (
+                    body.decode() if isinstance(body, (bytes, bytearray)) else str(body)
+                )
             except Exception:
                 return ""
     return ""
@@ -1554,6 +2079,49 @@ def _owui_extract_message(response: Any) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# Ollama model -> can it think (from /api/show); a model's capabilities do not change while it is installed.
+_OLLAMA_CAN_THINK: dict = {}
+
+
+def _ollama_get(
+    url: str, path: str, body: Optional[dict] = None, timeout: float = 2.0
+) -> Any:
+    import urllib.request
+
+    request = urllib.request.Request(
+        url.rstrip("/") + path,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"content-type": "application/json"},
+        method="POST" if body is not None else "GET",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read())
+
+
+async def _ollama_model_state(base_urls: list, name: str) -> tuple:
+    """(loaded, can_think) for an Ollama model; either is None when no server answered."""
+    loaded: Optional[bool] = None
+    can_think: Optional[bool] = _OLLAMA_CAN_THINK.get(name)
+    for url in base_urls:
+        try:
+            running = await asyncio.to_thread(_ollama_get, url, "/api/ps")
+            names = {m.get("name") for m in running.get("models", [])} | {
+                m.get("model") for m in running.get("models", [])
+            }
+            loaded = bool(loaded) or name in names
+            if can_think is None:
+                shown = await asyncio.to_thread(
+                    _ollama_get, url, "/api/show", {"model": name}
+                )
+                can_think = "thinking" in (shown.get("capabilities") or [])
+                _OLLAMA_CAN_THINK[name] = can_think
+        except Exception:
+            continue
+        if loaded:
+            break
+    return loaded, can_think
+
+
 class Pipe:
     """Open WebUI Pipe entrypoint. Appears as a selectable model."""
 
@@ -1580,10 +2148,14 @@ class Pipe:
         )
         # --- Extra sampling params (applied to all phases) --------------------
         # Sentinel -1 means "unset / use the backend default".
-        TOP_P: float = Field(default=-1.0, description="Nucleus sampling top_p. -1 = unset.")
+        TOP_P: float = Field(
+            default=-1.0, description="Nucleus sampling top_p. -1 = unset."
+        )
         TOP_K: int = Field(default=-1, description="top_k sampling. -1 = unset.")
         MIN_P: float = Field(default=-1.0, description="min_p sampling. -1 = unset.")
-        MAX_TOKENS: int = Field(default=-1, description="Max tokens to generate. -1 = unset.")
+        MAX_TOKENS: int = Field(
+            default=-1, description="Max tokens to generate. -1 = unset."
+        )
         REPEAT_PENALTY: float = Field(
             default=-1.0, description="repeat_penalty (local backends). -1 = unset."
         )
@@ -1593,7 +2165,9 @@ class Pipe:
         PRESENCE_PENALTY: float = Field(
             default=-999.0, description="presence_penalty (-2..2). -999 = unset."
         )
-        SEED: int = Field(default=-1, description="Sampling seed for reproducibility. -1 = unset.")
+        SEED: int = Field(
+            default=-1, description="Sampling seed for reproducibility. -1 = unset."
+        )
         # JSON escape hatches for anything not covered above. Merge order:
         # EXTRA_PARAMS (base) < the dedicated valves above < per-phase JSON.
         EXTRA_PARAMS_JSON: str = Field(
@@ -1601,13 +2175,16 @@ class Pipe:
             description='Base extra params as a JSON object, e.g. {"tfs_z": 1.0}. Applied to all phases.',
         )
         PLANNING_PARAMS_JSON: str = Field(
-            default="", description="Per-phase param overrides for PLANNING as a JSON object."
+            default="",
+            description="Per-phase param overrides for PLANNING as a JSON object.",
         )
         EXECUTION_PARAMS_JSON: str = Field(
-            default="", description="Per-phase param overrides for EXECUTION as a JSON object."
+            default="",
+            description="Per-phase param overrides for EXECUTION as a JSON object.",
         )
         SYNTHESIS_PARAMS_JSON: str = Field(
-            default="", description="Per-phase param overrides for SYNTHESIS/REVIEW as a JSON object."
+            default="",
+            description="Per-phase param overrides for SYNTHESIS/REVIEW as a JSON object.",
         )
         # --- MCP tool calling (execution phase) -------------------------------
         MCP_ENABLED: bool = Field(
@@ -1627,14 +2204,24 @@ class Pipe:
             description="Auto-discover MCP/tool servers from Open WebUI's configuration (used when MCP_SERVERS_JSON is empty). Falls back to MCP_URL.",
         )
         MAX_TOOL_ITERATIONS: int = Field(
-            default=6, description="Max tool-call rounds per task before forcing a final answer."
+            default=6,
+            description="Max tool-call rounds per task before forcing a final answer.",
         )
         TOOL_RESULT_LIMIT: int = Field(
-            default=4000, description="Per tool-result character limit fed back to the model."
+            default=4000,
+            description="Per tool-result character limit fed back to the model.",
         )
         PLAN_MODE: bool = Field(
             default=True,
             description="Decompose into tasks first. Disable for a single-pass answer.",
+        )
+        AUTO_SKIP_PLAN: bool = Field(
+            default=True,
+            description="Even with PLAN_MODE on, skip planning and answer directly for short/simple requests.",
+        )
+        SHORT_TASK_MAX_WORDS: int = Field(
+            default=20,
+            description="Max word count for a request to be considered 'short' by AUTO_SKIP_PLAN.",
         )
         MAX_TASKS: int = Field(default=20, description="Max tasks in the plan.")
         TASK_RESULT_LIMIT: int = Field(
@@ -1646,6 +2233,58 @@ class Pipe:
         )
         EMIT_STATUS: bool = Field(
             default=True, description="Emit progress as status updates in the UI."
+        )
+        KEV_URL: str = Field(
+            default="",
+            description="Kev System One endpoint (e.g. http://127.0.0.1:8009). Empty = no typed decisions, the planner behaves as before.",
+        )
+        KEV_API_KEY: str = Field(
+            default="",
+            description="Bearer token, when the Kev endpoint was started with KEV_API_KEY set.",
+        )
+        KEV_DECIDE_PLANNING: bool = Field(
+            default=True,
+            description="Let Kev decide whether a request is simple (answered in one pass) or needs decomposing, instead of the word-count heuristic.",
+        )
+        KEV_CLASSIFY_REQUEST: bool = Field(
+            default=True,
+            description="Ask Kev whether the request needs thinking (off: reasoning disabled) and whether it is artistic or scientific (sets the base temperature).",
+        )
+        KEV_ARTISTIC_TEMPERATURE: float = Field(
+            default=1.0,
+            description="Base temperature when Kev judges the request artistic/creative.",
+        )
+        KEV_SCIENTIFIC_TEMPERATURE: float = Field(
+            default=0.3,
+            description="Base temperature when Kev judges the request scientific/factual.",
+        )
+        KEV_ASK_TOOLS: bool = Field(
+            default=True,
+            description="Ask Kev whether the request needs tools (lookup, live data, memory); if not, the model is not offered any.",
+        )
+        FAST_SMALL_TALK: bool = Field(
+            default=True,
+            description="Greetings, thanks, ok: answer at once, without Kev, planning, tools or thinking.",
+        )
+        THINK_IN_PLANNING: bool = Field(
+            default=False,
+            description="When Kev turns thinking on, let the planning and synthesis phases think too (slower). Off = only task execution thinks.",
+        )
+        SKIP_SINGLE_TASK_SYNTHESIS: bool = Field(
+            default=True,
+            description="A plan of one task returns that task's result instead of a synthesis pass.",
+        )
+        SKIP_WARMUP_IF_LOADED: bool = Field(
+            default=True,
+            description="Skip the warm-up call when Ollama already has the model loaded (checks /api/ps).",
+        )
+        KEV_CHECK_TASKS: bool = Field(
+            default=True,
+            description="After each task, ask Kev whether the result carries out the task; retry if it does not.",
+        )
+        KEV_GATE_REVIEW: bool = Field(
+            default=True,
+            description="Run the review pass only when Kev judges the draft incomplete. Overrides ENABLE_REVIEW in both directions.",
         )
         SYSTEM_PROMPT: str = Field(
             default=DEFAULT_SYSTEM_PROMPT, description="Base system prompt."
@@ -1845,6 +2484,23 @@ class Pipe:
             if asyncio.iscoroutine(user):
                 user = await user
 
+        try:
+            owned_by = (
+                (getattr(__request__.app.state, "MODELS", {}) or {}).get(model_id) or {}
+            ).get("owned_by")
+        except Exception:
+            owned_by = None
+
+        def _apply_params(form: dict, params: Optional[dict]) -> None:
+            """Put the sampling params where the backend reads them. Open WebUI's OpenAI->Ollama conversion keeps
+            only `options` (and moves `think` from there to the root); a top-level temperature never reaches Ollama.
+            """
+            params = {k: v for k, v in (params or {}).items() if v is not None}
+            if owned_by == "ollama":
+                form["options"] = {"temperature": form["temperature"], **params}
+            else:
+                form.update(_openai_think_fields(params) or {})
+
         async def progress(message: str) -> None:
             if __event_emitter__ and valves.EMIT_STATUS:
                 await __event_emitter__(
@@ -1872,10 +2528,8 @@ class Pipe:
                     {"role": "user", "content": user_message},
                 ],
             }
-            # Extra sampling params are forwarded verbatim to the backend.
-            for key, value in (params or {}).items():
-                if value is not None:
-                    base_form[key] = value
+            # Extra sampling params are forwarded to the backend.
+            _apply_params(base_form, params)
 
             # Request structured JSON when asked, degrading across backends:
             #   1. json_schema  -> LM Studio / OpenAI structured outputs (strict,
@@ -1895,7 +2549,9 @@ class Pipe:
                         },
                     }
                 )
-                attempts.append({**base_form, "response_format": {"type": "json_object"}})
+                attempts.append(
+                    {**base_form, "response_format": {"type": "json_object"}}
+                )
             attempts.append(base_form)
 
             last_response: Any = None
@@ -1931,9 +2587,7 @@ class Pipe:
                 ),
                 "messages": messages,
             }
-            for key, value in (params or {}).items():
-                if value is not None:
-                    form_data[key] = value
+            _apply_params(form_data, params)
             if tools:
                 form_data["tools"] = tools
                 form_data["tool_choice"] = "auto"
@@ -1995,7 +2649,9 @@ class Pipe:
                 discovered = self._discover_mcp_servers(__request__)
                 if discovered:
                     names = ", ".join(s.get("name", "?") for s in discovered)
-                    await progress(f"Discovered {len(discovered)} MCP server(s): {names}")
+                    await progress(
+                        f"Discovered {len(discovered)} MCP server(s): {names}"
+                    )
                     mcp_servers = discovered
             if not mcp_servers and valves.MCP_URL.strip():
                 mcp_servers = [
@@ -2005,6 +2661,28 @@ class Pipe:
                         "url": valves.MCP_URL.strip(),
                     }
                 ]
+
+        # Ollama: is the model already loaded (then the warm-up is wasted), and can it think at all (then Kev is
+        # not asked whether it should)?
+        loaded, can_think = None, None
+        if owned_by == "ollama":
+            try:
+                from open_webui.models.config import Config
+
+                base_urls = list(await Config.get("ollama.base_urls", []) or [])
+            except Exception:
+                try:
+                    from open_webui.config import OLLAMA_BASE_URLS as base_urls
+                except Exception:
+                    base_urls = []
+            try:
+                info = (getattr(__request__.app.state, "MODELS", {}) or {}).get(
+                    model_id
+                ) or {}
+                name = (info.get("ollama") or {}).get("model") or model_id
+            except Exception:
+                name = model_id
+            loaded, can_think = await _ollama_model_state(base_urls, name)
 
         config = PlannerConfig(
             model=model_id,
@@ -2017,12 +2695,27 @@ class Pipe:
             execution_params=_parse_json_params(valves.EXECUTION_PARAMS_JSON),
             synthesis_params=_parse_json_params(valves.SYNTHESIS_PARAMS_JSON),
             plan_mode=valves.PLAN_MODE,
+            auto_skip_plan_for_short_tasks=valves.AUTO_SKIP_PLAN,
+            short_task_max_words=valves.SHORT_TASK_MAX_WORDS,
             max_tasks=valves.MAX_TASKS,
             task_result_limit=valves.TASK_RESULT_LIMIT,
             enable_review=valves.ENABLE_REVIEW,
             mcp_servers=mcp_servers,
             max_tool_iterations=valves.MAX_TOOL_ITERATIONS,
             tool_result_limit=valves.TOOL_RESULT_LIMIT,
+            kev_url=valves.KEV_URL,
+            kev_api_key=valves.KEV_API_KEY,
+            kev_decide_planning=valves.KEV_DECIDE_PLANNING,
+            kev_classify_request=valves.KEV_CLASSIFY_REQUEST,
+            kev_artistic_temperature=valves.KEV_ARTISTIC_TEMPERATURE,
+            kev_scientific_temperature=valves.KEV_SCIENTIFIC_TEMPERATURE,
+            kev_ask_tools=valves.KEV_ASK_TOOLS,
+            fast_small_talk=valves.FAST_SMALL_TALK,
+            think_in_planning=valves.THINK_IN_PLANNING,
+            skip_single_task_synthesis=valves.SKIP_SINGLE_TASK_SYNTHESIS,
+            model_can_think=can_think,
+            kev_check_tasks=valves.KEV_CHECK_TASKS,
+            kev_gate_review=valves.KEV_GATE_REVIEW,
             verbose=False,
         )
         planner = StandalonePlanner(
@@ -2036,12 +2729,38 @@ class Pipe:
         if not valves.PLANNER_MODEL.strip():
             await progress(f"Using model: {model_id}")
 
+        # Warm up the model before the real work starts. Local backends like
+        # Ollama can take tens of seconds to minutes to load a model on its
+        # first call; if that cold start happens mid-plan (buried inside one
+        # of the Planner's many sequential calls) it's more likely to trip an
+        # upstream timeout (reverse proxy, Open WebUI itself) and abort the
+        # whole run. Doing one throwaway call up front absorbs that cost
+        # before anything depends on it. Best-effort: failures here are
+        # ignored and surface naturally on the real calls instead.
+        if loaded and valves.SKIP_WARMUP_IF_LOADED:
+            await progress(f"Model already loaded: {model_id}")
+        else:
+            await progress(f"Warming up model: {model_id}...")
+            try:
+                await complete(
+                    "You are a helpful assistant.",
+                    "Reply with only the word: ready",
+                    0.0,
+                    False,
+                    {"max_tokens": 5, **({"think": False} if can_think else {})},
+                )
+            except Exception:
+                pass
+
         try:
             result = await planner.run(goal)
         except Exception as exc:
             if __event_emitter__ and valves.EMIT_STATUS:
                 await __event_emitter__(
-                    {"type": "status", "data": {"description": f"Error: {exc}", "done": True}}
+                    {
+                        "type": "status",
+                        "data": {"description": f"Error: {exc}", "done": True},
+                    }
                 )
             return f"❌ Planner error: {exc}"
 
@@ -2068,37 +2787,143 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description="Standalone agentic planner (no subagents, no Open WebUI)."
     )
     parser.add_argument("goal", nargs="*", help="The request/goal to fulfill.")
-    parser.add_argument("--model", default=None, help="Model id (default: $PLANNER_MODEL or gpt-4o-mini)")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Model id (default: $PLANNER_MODEL or gpt-4o-mini)",
+    )
     parser.add_argument("--api-url", default=None, help="OpenAI-compatible base URL")
-    parser.add_argument("--api-key", default=None, help="API key (default: $OPENAI_API_KEY)")
-    parser.add_argument("--temperature", type=float, default=None, help="Base sampling temperature")
-    parser.add_argument("--planning-temperature", type=float, default=None, help="Planning-phase temperature (default: auto = min(base, 0.4))")
-    parser.add_argument("--execution-temperature", type=float, default=None, help="Execution-phase temperature (default: base)")
-    parser.add_argument("--synthesis-temperature", type=float, default=None, help="Synthesis/review-phase temperature (default: base)")
+    parser.add_argument(
+        "--api-key", default=None, help="API key (default: $OPENAI_API_KEY)"
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=None, help="Base sampling temperature"
+    )
+    parser.add_argument(
+        "--planning-temperature",
+        type=float,
+        default=None,
+        help="Planning-phase temperature (default: auto = min(base, 0.4))",
+    )
+    parser.add_argument(
+        "--execution-temperature",
+        type=float,
+        default=None,
+        help="Execution-phase temperature (default: base)",
+    )
+    parser.add_argument(
+        "--synthesis-temperature",
+        type=float,
+        default=None,
+        help="Synthesis/review-phase temperature (default: base)",
+    )
     # Extra sampling params (applied to all phases).
-    parser.add_argument("--top-p", type=float, default=None, help="Nucleus sampling top_p")
+    parser.add_argument(
+        "--top-p", type=float, default=None, help="Nucleus sampling top_p"
+    )
     parser.add_argument("--top-k", type=int, default=None, help="top_k sampling")
     parser.add_argument("--min-p", type=float, default=None, help="min_p sampling")
-    parser.add_argument("--max-tokens", type=int, default=None, help="Max tokens to generate")
-    parser.add_argument("--repeat-penalty", type=float, default=None, help="repeat_penalty (local backends)")
-    parser.add_argument("--frequency-penalty", type=float, default=None, help="frequency_penalty (-2..2)")
-    parser.add_argument("--presence-penalty", type=float, default=None, help="presence_penalty (-2..2)")
+    parser.add_argument(
+        "--max-tokens", type=int, default=None, help="Max tokens to generate"
+    )
+    parser.add_argument(
+        "--repeat-penalty",
+        type=float,
+        default=None,
+        help="repeat_penalty (local backends)",
+    )
+    parser.add_argument(
+        "--frequency-penalty",
+        type=float,
+        default=None,
+        help="frequency_penalty (-2..2)",
+    )
+    parser.add_argument(
+        "--presence-penalty", type=float, default=None, help="presence_penalty (-2..2)"
+    )
     parser.add_argument("--seed", type=int, default=None, help="Sampling seed")
-    parser.add_argument("--params", default=None, help='Base extra params as JSON, e.g. \'{"tfs_z":1.0}\' (applied to all phases)')
-    parser.add_argument("--planning-params", default=None, help="Per-phase param overrides for planning as JSON")
-    parser.add_argument("--execution-params", default=None, help="Per-phase param overrides for execution as JSON")
-    parser.add_argument("--synthesis-params", default=None, help="Per-phase param overrides for synthesis/review as JSON")
+    parser.add_argument(
+        "--params",
+        default=None,
+        help="Base extra params as JSON, e.g. '{\"tfs_z\":1.0}' (applied to all phases)",
+    )
+    parser.add_argument(
+        "--planning-params",
+        default=None,
+        help="Per-phase param overrides for planning as JSON",
+    )
+    parser.add_argument(
+        "--execution-params",
+        default=None,
+        help="Per-phase param overrides for execution as JSON",
+    )
+    parser.add_argument(
+        "--synthesis-params",
+        default=None,
+        help="Per-phase param overrides for synthesis/review as JSON",
+    )
     # MCP tool calling (execution phase).
-    parser.add_argument("--mcp-url", default=None, help="streamable-http MCP server URL (enables tool calling)")
-    parser.add_argument("--mcp-config", default=None, help="JSON array of MCP servers (overrides --mcp-url)")
-    parser.add_argument("--max-tool-iterations", type=int, default=None, help="Max tool-call rounds per task")
-    parser.add_argument("--tool-result-limit", type=int, default=None, help="Per tool-result char limit")
-    parser.add_argument("--max-tasks", type=int, default=None, help="Max tasks in the plan")
-    parser.add_argument("--no-plan", action="store_true", help="Disable planning; single-pass")
-    parser.add_argument("--review", action="store_true", help="Add a self-review/refine pass")
-    parser.add_argument("--quiet", action="store_true", help="Suppress progress logging")
+    parser.add_argument(
+        "--mcp-url",
+        default=None,
+        help="streamable-http MCP server URL (enables tool calling)",
+    )
+    parser.add_argument(
+        "--mcp-config",
+        default=None,
+        help="JSON array of MCP servers (overrides --mcp-url)",
+    )
+    parser.add_argument(
+        "--max-tool-iterations",
+        type=int,
+        default=None,
+        help="Max tool-call rounds per task",
+    )
+    parser.add_argument(
+        "--tool-result-limit", type=int, default=None, help="Per tool-result char limit"
+    )
+    parser.add_argument(
+        "--max-tasks", type=int, default=None, help="Max tasks in the plan"
+    )
+    parser.add_argument(
+        "--no-plan", action="store_true", help="Disable planning; single-pass"
+    )
+    parser.add_argument(
+        "--force-plan",
+        action="store_true",
+        help="Always plan, even for short/simple requests (disables auto-skip)",
+    )
+    parser.add_argument(
+        "--short-task-max-words",
+        type=int,
+        default=None,
+        help="Max word count for a request to be treated as 'short' (auto-skip planning)",
+    )
+    parser.add_argument(
+        "--review", action="store_true", help="Add a self-review/refine pass"
+    )
+    parser.add_argument(
+        "--kev-url",
+        default=None,
+        help="Kev System One endpoint for the typed decisions (default: $KEV_URL; empty disables them)",
+    )
+    parser.add_argument(
+        "--no-kev",
+        action="store_true",
+        help="Ignore $KEV_URL: decide with the word-count heuristic and no task or review checks",
+    )
+    parser.add_argument(
+        "--no-kev-classify",
+        action="store_true",
+        help="Keep Kev's other decisions but not the thinking switch and the artistic/scientific temperature",
+    )
+    parser.add_argument(
+        "--quiet", action="store_true", help="Suppress progress logging"
+    )
     parser.add_argument("--json", action="store_true", help="Emit full result as JSON")
-    parser.add_argument("--system-prompt", default=None, help="Override the base system prompt")
+    parser.add_argument(
+        "--system-prompt", default=None, help="Override the base system prompt"
+    )
     return parser
 
 
@@ -2168,8 +2993,18 @@ async def _run_cli(args: argparse.Namespace, goal: str) -> int:
         config.max_tasks = args.max_tasks
     if args.no_plan:
         config.plan_mode = False
+    if args.force_plan:
+        config.auto_skip_plan_for_short_tasks = False
+    if args.short_task_max_words is not None:
+        config.short_task_max_words = args.short_task_max_words
     if args.review:
         config.enable_review = True
+    if args.kev_url is not None:
+        config.kev_url = args.kev_url
+    if args.no_kev:
+        config.kev_url = ""
+    if args.no_kev_classify:
+        config.kev_classify_request = False
     if args.quiet:
         config.verbose = False
 
@@ -2229,7 +3064,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     goal = " ".join(args.goal).strip() or sys.stdin.read().strip()
     if not goal:
-        print("error: no goal provided (pass as arguments or via stdin)", file=sys.stderr)
+        print(
+            "error: no goal provided (pass as arguments or via stdin)", file=sys.stderr
+        )
         return 2
     return asyncio.run(_run_cli(args, goal))
 
