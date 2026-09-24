@@ -1147,6 +1147,13 @@ class StandalonePlanner:
             tools = (
                 self._mcp.openai_tools() if self._mcp is not None and gate_open else []
             )
+            single.tools = [
+                (t.get("function") or {}).get("name") for t in tools if t.get("function")
+            ]
+            # Plan mode is off, so the planning-phase "must verify with a solver" prompt
+            # never runs; without this, single-pass execution silently drops the math/
+            # logic verification requirement even when a verification tool is available.
+            math_verification = bool(set(single.tools) & _MATH_VERIFY_TOOL_NAMES)
 
             # Inject time context
             time_context = self._get_current_time_context()
@@ -1157,12 +1164,37 @@ class StandalonePlanner:
                 )
 
             if tools and self.chat is not None:
-                single.result = await self._execute_with_tools(
-                    user_message, tools, task_id=single.task_id
-                )
+                for attempt in range(2):
+                    self._verify_tool_called = False
+                    single.result = await self._execute_with_tools(
+                        user_message,
+                        tools,
+                        attempt,
+                        math_verification=math_verification,
+                        task_id=single.task_id,
+                    )
+                    if not (
+                        self.config.kev_check_math
+                        and math_verification
+                        and not self._verify_tool_called
+                        and attempt == 0
+                    ):
+                        break
+                    await self._emit(
+                        f"{single.task_id}: no verification tool was called; retrying"
+                    )
+                    user_message += (
+                        "\n\n⚠️ IMPORTANT: Your previous attempt stated a formula or "
+                        "claim but never called a verification tool (check_equation, "
+                        "check_consistency, check_entailment, z3_solve_constraints, "
+                        "z3_prove_theorem, or verify_claims). Call one now to check "
+                        "your result before writing the final answer."
+                    )
             else:
                 single.result = await self.complete(
-                    PromptBuilder.execution_prompt(self.system_prompt),
+                    PromptBuilder.execution_prompt(
+                        self.system_prompt, math_verification=math_verification
+                    ),
                     user_message,
                     self._execution_temperature(),
                     False,

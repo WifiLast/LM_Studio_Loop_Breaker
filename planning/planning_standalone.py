@@ -2106,6 +2106,13 @@ class StandalonePlanner:
             tools = (
                 self._mcp.openai_tools() if self._mcp is not None and gate_open else []
             )
+            single.tools = [
+                (t.get("function") or {}).get("name") for t in tools if t.get("function")
+            ]
+            # Plan mode is off, so the planning-phase "must verify with a solver" prompt
+            # never runs; without this, single-pass execution silently drops the math/
+            # logic verification requirement even when a verification tool is available.
+            math_verification = bool(set(single.tools) & _MATH_VERIFY_TOOL_NAMES)
 
             # Inject time context
             time_context = self._get_current_time_context()
@@ -2116,12 +2123,37 @@ class StandalonePlanner:
                 )
 
             if tools and self.chat is not None:
-                single.result = await self._execute_with_tools(
-                    user_message, tools, task_id=single.task_id
-                )
+                for attempt in range(2):
+                    self._verify_tool_called = False
+                    single.result = await self._execute_with_tools(
+                        user_message,
+                        tools,
+                        attempt,
+                        math_verification=math_verification,
+                        task_id=single.task_id,
+                    )
+                    if not (
+                        self.config.kev_check_math
+                        and math_verification
+                        and not self._verify_tool_called
+                        and attempt == 0
+                    ):
+                        break
+                    await self._emit(
+                        f"{single.task_id}: no verification tool was called; retrying"
+                    )
+                    user_message += (
+                        "\n\n⚠️ IMPORTANT: Your previous attempt stated a formula or "
+                        "claim but never called a verification tool (check_equation, "
+                        "check_consistency, check_entailment, z3_solve_constraints, "
+                        "z3_prove_theorem, or verify_claims). Call one now to check "
+                        "your result before writing the final answer."
+                    )
             else:
                 single.result = await self.complete(
-                    PromptBuilder.execution_prompt(self.system_prompt),
+                    PromptBuilder.execution_prompt(
+                        self.system_prompt, math_verification=math_verification
+                    ),
                     user_message,
                     self._execution_temperature(),
                     False,
@@ -3009,7 +3041,18 @@ class Pipe:
             else:
                 form.update(_openai_think_fields(params) or {})
 
+        # Status events are transient: Open WebUI's status widget only ever shows the
+        # latest one and doesn't persist them on the message, so a "thinking" line is
+        # overwritten by the next status (often within the same tick) before anyone can
+        # read it, and it's gone entirely once the response finishes. Collect thought
+        # lines separately so they can be embedded in the final message as a `<think>`
+        # block - which Open WebUI renders as a persistent, expandable section - instead
+        # of relying on the fleeting status trace to carry them.
+        collected_thoughts: list[str] = []
+
         async def progress(message: str) -> None:
+            if "\U0001f4ad" in message and " thinking:\n" in message:
+                collected_thoughts.append(message.split("\U0001f4ad ", 1)[1])
             if __event_emitter__ and valves.EMIT_STATUS:
                 await __event_emitter__(
                     {
@@ -3293,6 +3336,9 @@ class Pipe:
                     },
                 }
             )
+        if collected_thoughts:
+            think_block = "\n\n".join(collected_thoughts)
+            return f"<think>\n{think_block}\n</think>\n\n{result.final_output}"
         return result.final_output
 
 

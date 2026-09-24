@@ -1,0 +1,4 @@
+args.check test
+parsed check = True
+OK: combined output compiles cleanly (3640 lines)
+main returned 0
