@@ -1,0 +1,153 @@
+Let me verify this properly with Z3 before I answer. I'll encode the puzzle: three boxes (labeled Apples, Oranges, Mixed) each assigned one of three actual contents (0 = pure apples, 1 = pure oranges, 2 = mixed), all labels wrong, then check what a single fruit observation determines for each possible pick.
+
+Untersucht 6 2_z3_solve_constraints
+Ergebnis von 2_z3_solve_constraints ansehen
+EINGABE
+constraints
+["xA >= 0","xA <= 2","xO >= 0","xO <= 2","xM >= 0","xM <= 2","xA != xO","xO != xM","xA != xM","xA != 0","xO != 1","xM != 2","xM == 0 Or xM == 2"]
+vars
+{"xA":"Int","xM":"Int","xO":"Int"}
+AUSGABE
+{
+  "ok": false,
+  "reason": "Unable to parse constraints: invalid syntax (<string>, line 1)",
+  "suggestion": "Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+  "status": "invalid_expression"
+}
+Ergebnis von 2_z3_solve_constraints ansehen
+EINGABE
+constraints
+["xA >= 0","xA <= 2","xO >= 0","xO <= 2","xM >= 0","xM <= 2","xA != xO","xO != xM","xA != xM","xA != 0","xO != 1","xM != 2","xM == 1 Or xM == 2"]
+vars
+{"xA":"Int","xM":"Int","xO":"Int"}
+AUSGABE
+{
+  "ok": false,
+  "reason": "Unable to parse constraints: invalid syntax (<string>, line 1)",
+  "suggestion": "Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+  "status": "invalid_expression"
+}
+Ergebnis von 2_z3_solve_constraints ansehen
+EINGABE
+constraints
+["xA >= 0","xA <= 2","xO >= 0","xO <= 2","xM >= 0","xM <= 2","xA != xO","xO != xM","xA != xM","xA != 0","xO != 1","xM != 2","xA == 0 Or xA == 2"]
+vars
+{"xA":"Int","xM":"Int","xO":"Int"}
+AUSGABE
+{
+  "ok": false,
+  "reason": "Unable to parse constraints: invalid syntax (<string>, line 1)",
+  "suggestion": "Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+  "status": "invalid_expression"
+}
+Ergebnis von 2_z3_solve_constraints ansehen
+EINGABE
+constraints
+["xA >= 0","xA <= 2","xO >= 0","xO <= 2","xM >= 0","xM <= 2","xA != xO","xO != xM","xA != xM","xA != 0","xO != 1","xM != 2","xA == 1 Or xA == 2"]
+vars
+{"xA":"Int","xM":"Int","xO":"Int"}
+AUSGABE
+{
+  "ok": false,
+  "reason": "Unable to parse constraints: invalid syntax (<string>, line 1)",
+  "suggestion": "Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+  "status": "invalid_expression"
+}
+Ergebnis von 2_z3_solve_constraints ansehen
+Ergebnis von 2_z3_solve_constraints ansehen
+
+Nachgedacht für 3 Sekunden
+Let me probe the syntax first:
+
+Untersucht 6 2_z3_solve_constraints
+Ergebnis von 2_z3_solve_constraints ansehen
+EINGABE
+constraints
+["x >= 0","x != 1","x == 0 Or x == 2"]
+vars
+{"x":"Int"}
+AUSGABE
+{
+  "ok": false,
+  "reason": "Unable to parse constraints: invalid syntax (<string>, line 1)",
+  "suggestion": "Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+  "status": "invalid_expression"
+}
+
+Gedanke
+Ergebnis von 2_z3_solve_constraints ansehen
+EINGABE
+constraints
+["x == 0 Or x == 2","x < 3","x > -1"]
+vars
+{"x":"Int"}
+AUSGABE
+{
+  "ok": false,
+  "reason": "Unable to parse constraints: invalid syntax (<string>, line 1)",
+  "suggestion": "Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+  "status": "invalid_expression"
+}
+Ergebnis von 2_z3_solve_constraints ansehen
+EINGABE
+constraints
+["a == 0 Or a == 2","b == 0 Or b == 2","a != b"]
+vars
+{"a":"Int","b":"Int"}
+AUSGABE
+{
+  "ok": false,
+  "reason": "Unable to parse constraints: invalid syntax (<string>, line 1)",
+  "suggestion": "Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+  "status": "invalid_expression"
+}
+
+Gedanke
+Ergebnis von 2_z3_solve_constraints ansehen
+EINGABE
+constraints
+["x == 0 Or x == 2"]
+vars
+{"x":"Int"}
+AUSGABE
+{
+  "ok": false,
+  "reason": "Unable to parse constraints: invalid syntax (<string>, line 1)",
+  "suggestion": "Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+  "status": "invalid_expression"
+}
+Ergebnis von 2_z3_solve_constraints ansehen
+EINGABE
+constraints
+["x == 0 or x == 2"]
+vars
+{"x":"Int"}
+AUSGABE
+{
+  "ok": true,
+  "reason": "The constraints are satisfiable.",
+  "suggestion": "",
+  "value": {
+    "model": {
+      "or": "0",
+      "x": "2"
+    },
+    "constraints": [
+      "x == 0 or x == 2"
+    ]
+  },
+  "status": "sat"
+}
+Ergebnis von 2_z3_solve_constraints ansehen
+EINGABE
+constraints
+["x != 1","x > -1","x < 3"]
+vars
+{"x":"Int"}
+AUSGABE
+{
+  "ok": false,
+  "reason": "Unable to parse constraints: invalid syntax (<string>, line 1)",
+  "suggestion": "Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+  "status": "invalid_expression"
+}

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import builtins
 import importlib
 import itertools
+import keyword
 import os
 import re
 import sys
@@ -444,7 +446,87 @@ def _find_bracket(func: Callable[[float], float], bracket_start: float, bracket_
 
 def _extract_symbol_names(expression: str) -> list[str]:
     names = set(re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", expression))
-    return sorted(name for name in names if name not in _Z3_RESERVED_NAMES)
+    return sorted(
+        name
+        for name in names
+        if name not in _Z3_RESERVED_NAMES and not keyword.iskeyword(name)
+    )
+
+
+class _BoolOpToZ3(ast.NodeTransformer):
+    """Rewrite Python's `and` / `or` / `not` into calls to Z3's `And` / `Or` / `Not`.
+
+    Z3's `BoolRef` does not raise on Python's `bool()` the way one might expect, so
+    Python's own short-circuit `and`/`or` silently evaluate against a z3 symbolic
+    expression's truthiness (unrelated to its logical meaning) and discard one operand
+    entirely - e.g. `x == 0 or x == 2` does NOT build `Or(x==0, x==2)`; it silently
+    asserts only one of the two comparisons, with no error, and no way to tell from the
+    result alone that anything went wrong. This is the single most common way a
+    language model's z3 constraint quietly does the wrong thing (see math/z3_usage.log
+    for a real trace: half a dozen `"x == 0 Or x == 2"` attempts failed on invalid
+    syntax, and the lowercase `"or"` retry that finally returned `ok: true` had in fact
+    silently dropped one side of the disjunction).
+
+    Rewriting at the AST level - rather than a text substitution of `and`/`or` to
+    `&`/`|` - preserves operator precedence correctly: `&`/`|` bind tighter than `==` in
+    Python, so `x == 0 | x == 2` parses as `x == (0 | x) == 2`, not the intended
+    disjunction. Transforming the parsed tree sidesteps that trap entirely.
+    """
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> ast.AST:
+        self.generic_visit(node)
+        func_name = "And" if isinstance(node.op, ast.And) else "Or"
+        return ast.copy_location(
+            ast.Call(
+                func=ast.Name(id=func_name, ctx=ast.Load()),
+                args=node.values,
+                keywords=[],
+            ),
+            node,
+        )
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.AST:
+        self.generic_visit(node)
+        if isinstance(node.op, ast.Not):
+            return ast.copy_location(
+                ast.Call(
+                    func=ast.Name(id="Not", ctx=ast.Load()),
+                    args=[node.operand],
+                    keywords=[],
+                ),
+                node,
+            )
+        return node
+
+
+def _compile_logic_expression(expression: str):
+    """Parse a claim/constraint expression and rewrite and/or/not into Z3's And/Or/Not
+    calls (see `_BoolOpToZ3`) before compiling, so natural lowercase boolean language
+    ("a == 1 or a == 2") produces correct Z3 logic instead of silently wrong logic."""
+    tree = ast.parse(expression, mode="eval")
+    tree = _BoolOpToZ3().visit(tree)
+    ast.fix_missing_locations(tree)
+    return compile(tree, "<expression>", "eval")
+
+
+_INFIX_BOOL_KEYWORD_RE = re.compile(r"\b(And|Or|Not)\b(?!\s*\()")
+
+
+def _boolean_syntax_hint(expression: str, default: str) -> str:
+    """A more specific suggestion when a SyntaxError looks like capitalized And/Or/Not
+    used as an infix operator (`a Or b`) - the most common z3 constraint mistake beyond
+    the silently-wrong lowercase case `_BoolOpToZ3` already fixes. `Or`/`And`/`Not` only
+    exist as Z3 functions, so they must be called with parentheses; as bare words they
+    are not valid Python syntax at all, which is what the raw SyntaxError doesn't say
+    explicitly."""
+    if _INFIX_BOOL_KEYWORD_RE.search(expression):
+        return (
+            "Use lowercase 'and'/'or'/'not' as infix operators (for example "
+            "'a == 1 or a == 2'), or call the capitalized Z3 functions with "
+            "parentheses: Or(a, b), And(a, b), Not(a). 'a Or b' without parentheses "
+            "is not valid syntax either way."
+        )
+    return default
 
 
 def _coerce_model_value(value: object) -> str:
@@ -816,14 +898,17 @@ def check_consistency(
 
     try:
         for fact in normalized_facts:
-            solver.add(eval(fact, {"__builtins__": {}}, eval_env))
-        solver.add(eval(normalized_claim, {"__builtins__": {}}, eval_env))
+            solver.add(eval(_compile_logic_expression(fact), {"__builtins__": {}}, eval_env))
+        solver.add(eval(_compile_logic_expression(normalized_claim), {"__builtins__": {}}, eval_env))
     except Exception as exc:
         return _verdict(
             False,
             status="invalid_expression",
             reason=f"Unable to parse claim or facts: {exc}",
-            suggestion="Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+            suggestion=_boolean_syntax_hint(
+                " ".join([*normalized_facts, normalized_claim]),
+                "Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+            ),
         )
 
     result = solver.check()
@@ -877,14 +962,21 @@ def check_entailment(
 
     try:
         for premise in normalized_premises:
-            solver.add(eval(premise, {"__builtins__": {}}, eval_env))
-        solver.add(_z3.Not(eval(normalized_claim, {"__builtins__": {}}, eval_env)))
+            solver.add(eval(_compile_logic_expression(premise), {"__builtins__": {}}, eval_env))
+        solver.add(
+            _z3.Not(
+                eval(_compile_logic_expression(normalized_claim), {"__builtins__": {}}, eval_env)
+            )
+        )
     except Exception as exc:
         return _verdict(
             False,
             status="invalid_expression",
             reason=f"Unable to parse the premises or claim: {exc}",
-            suggestion="Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+            suggestion=_boolean_syntax_hint(
+                " ".join([*normalized_premises, normalized_claim]),
+                "Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+            ),
         )
 
     result = solver.check()
@@ -1033,13 +1125,16 @@ def z3_solve_constraints(constraints: List[str], vars: Dict[str, str] | None = N
 
     try:
         for constraint in normalized:
-            solver.add(eval(constraint, {"__builtins__": {}}, eval_env))
+            solver.add(eval(_compile_logic_expression(constraint), {"__builtins__": {}}, eval_env))
     except Exception as exc:
         return _verdict(
             False,
             status="invalid_expression",
             reason=f"Unable to parse constraints: {exc}",
-            suggestion="Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+            suggestion=_boolean_syntax_hint(
+                " ".join(normalized),
+                "Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+            ),
         )
 
     result = solver.check()
@@ -1077,7 +1172,7 @@ def z3_add_constraint(constraint: str) -> Dict[str, object]:
     assert solver is not None
     variables = _ensure_context_variables([constraint])
     eval_env = _build_z3_eval_env(variables)
-    solver.add(eval(constraint, {"__builtins__": {}}, eval_env))
+    solver.add(eval(_compile_logic_expression(constraint), {"__builtins__": {}}, eval_env))
     constraints = solver_context["constraints"]
     assert isinstance(constraints, list)
     constraints.append(constraint)
