@@ -1,7 +1,0 @@
-C:\Users\wiffzack\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (7.4.3)/charset_normalizer (3.4.4) doesn't match a supported version!
-  warnings.warn(
-'(x !) == (0)'
-'(xA !) == (xO)'
-'x == 0'
-'x <= 5'
-'(x) == (5)'

@@ -306,7 +306,13 @@ def _build_callable(expression: str, variable: str) -> Callable[[float], float]:
 def _normalize_equation_expression(expression: str) -> str:
     """Normalize `lhs = rhs` into `lhs - (rhs)` so the numeric solver can find a root."""
     normalized = expression.strip()
-    if "=" in normalized and "==" not in normalized and "<=" not in normalized and ">=" not in normalized:
+    if (
+        "=" in normalized
+        and "==" not in normalized
+        and "!=" not in normalized
+        and "<=" not in normalized
+        and ">=" not in normalized
+    ):
         left, right = normalized.split("=", 1)
         return f"({left.strip()}) - ({right.strip()})"
     return normalized
@@ -595,8 +601,9 @@ def _verdict(
 ) -> Dict[str, object]:
     """Build a uniform tool verdict with repair hints.
 
-    Supported grammar for claim-shaped expressions: `==`, `<=`, `>=`, `<`, `>`, `+`, `-`,
-    `*`, `/`, `And`, `Or`, `Not`, `Implies`.
+    Supported grammar for claim-shaped expressions: `==`, `!=`, `<=`, `>=`, `<`, `>`,
+    `+`, `-`, `*`, `/`, lowercase `and`/`or`/`not`, or `And`/`Or`/`Not`/`Implies` as
+    function calls.
     """
 
     payload: Dict[str, object] = {
@@ -771,7 +778,13 @@ def _structured_model(model: object, variables: Dict[str, object]) -> Dict[str, 
 
 def _normalize_claim_expression(expression: str) -> str:
     normalized = expression.strip()
-    if "=" in normalized and "==" not in normalized and "<=" not in normalized and ">=" not in normalized:
+    if (
+        "=" in normalized
+        and "==" not in normalized
+        and "!=" not in normalized
+        and "<=" not in normalized
+        and ">=" not in normalized
+    ):
         left, right = normalized.split("=", 1)
         return f"({left.strip()}) == ({right.strip()})"
     return normalized
@@ -881,8 +894,10 @@ def check_consistency(
 ) -> Dict[str, object]:
     """Check whether a claim is consistent with known facts.
 
-    Supported grammar: `==`, `<=`, `>=`, `<`, `>`, `+`, `-`, `*`, `/`, `And`, `Or`,
-    `Not`, and `Implies`.
+    Supported grammar: `==`, `!=`, `<=`, `>=`, `<`, `>`, `+`, `-`, `*`, `/`, `Implies`,
+    and boolean combinators as lowercase infix `and`/`or`/`not` (preferred - e.g.
+    `x == 1 or x == 2`) or the capitalized Z3 functions `And(...)`/`Or(...)`/`Not(...)`
+    (NOT as infix - `a Or b` is invalid; call it `Or(a, b)`).
     """
 
     if not facts:
@@ -945,8 +960,10 @@ def check_entailment(
 ) -> Dict[str, object]:
     """Check whether premises entail a claim.
 
-    Supported grammar: `==`, `<=`, `>=`, `<`, `>`, `+`, `-`, `*`, `/`, `And`, `Or`,
-    `Not`, and `Implies`.
+    Supported grammar: `==`, `!=`, `<=`, `>=`, `<`, `>`, `+`, `-`, `*`, `/`, `Implies`,
+    and boolean combinators as lowercase infix `and`/`or`/`not` (preferred - e.g.
+    `x == 1 or x == 2`) or the capitalized Z3 functions `And(...)`/`Or(...)`/`Not(...)`
+    (NOT as infix - `a Or b` is invalid; call it `Or(a, b)`).
     """
 
     if not premises:
@@ -1041,8 +1058,10 @@ def verify_claims(claims: List[Dict[str, object]]) -> Dict[str, object]:
 
     Each item should include a `kind` key with one of `evaluate`, `check_equation`,
     `check_consistency`, `check_entailment`, or `solve_equation`.
-    Supported grammar: `==`, `<=`, `>=`, `<`, `>`, `+`, `-`, `*`, `/`, `And`, `Or`,
-    `Not`, and `Implies`.
+    Supported grammar: `==`, `!=`, `<=`, `>=`, `<`, `>`, `+`, `-`, `*`, `/`, `Implies`,
+    and boolean combinators as lowercase infix `and`/`or`/`not` (preferred - e.g.
+    `x == 1 or x == 2`) or the capitalized Z3 functions `And(...)`/`Or(...)`/`Not(...)`
+    (NOT as infix - `a Or b` is invalid; call it `Or(a, b)`).
     """
 
     if not claims:
@@ -1111,8 +1130,10 @@ def verify_claims(claims: List[Dict[str, object]]) -> Dict[str, object]:
 def z3_solve_constraints(constraints: List[str], vars: Dict[str, str] | None = None) -> Dict[str, object]:
     """Solve one or more symbolic constraints with Z3.
 
-    Supported grammar: `==`, `<=`, `>=`, `<`, `>`, `+`, `-`, `*`, `/`, `And`, `Or`,
-    `Not`, and `Implies`.
+    Supported grammar: `==`, `!=`, `<=`, `>=`, `<`, `>`, `+`, `-`, `*`, `/`, `Implies`,
+    and boolean combinators as lowercase infix `and`/`or`/`not` (preferred - e.g.
+    `x == 1 or x == 2`) or the capitalized Z3 functions `And(...)`/`Or(...)`/`Not(...)`
+    (NOT as infix - `a Or b` is invalid; call it `Or(a, b)`).
     """
 
     if not constraints:
@@ -1222,8 +1243,10 @@ def z3_solver_status() -> Dict[str, object]:
 def check_entailment_from_z3(premises: List[str], claim: str, vars: Dict[str, str] | None = None) -> Dict[str, object]:
     """Compatibility wrapper for claim-shaped entailment checks.
 
-    Supported grammar: `==`, `<=`, `>=`, `<`, `>`, `+`, `-`, `*`, `/`, `And`, `Or`,
-    `Not`, and `Implies`.
+    Supported grammar: `==`, `!=`, `<=`, `>=`, `<`, `>`, `+`, `-`, `*`, `/`, `Implies`,
+    and boolean combinators as lowercase infix `and`/`or`/`not` (preferred - e.g.
+    `x == 1 or x == 2`) or the capitalized Z3 functions `And(...)`/`Or(...)`/`Not(...)`
+    (NOT as infix - `a Or b` is invalid; call it `Or(a, b)`).
     """
 
     return _tool_fn(check_entailment)(premises, claim, vars)
@@ -1233,8 +1256,10 @@ def check_entailment_from_z3(premises: List[str], claim: str, vars: Dict[str, st
 def z3_prove_theorem(premises: List[str], conclusion: str, vars: Dict[str, str] | None = None) -> Dict[str, object]:
     """Compatibility wrapper around `check_entailment`.
 
-    Supported grammar: `==`, `<=`, `>=`, `<`, `>`, `+`, `-`, `*`, `/`, `And`, `Or`,
-    `Not`, and `Implies`.
+    Supported grammar: `==`, `!=`, `<=`, `>=`, `<`, `>`, `+`, `-`, `*`, `/`, `Implies`,
+    and boolean combinators as lowercase infix `and`/`or`/`not` (preferred - e.g.
+    `x == 1 or x == 2`) or the capitalized Z3 functions `And(...)`/`Or(...)`/`Not(...)`
+    (NOT as infix - `a Or b` is invalid; call it `Or(a, b)`).
     """
 
     result = _tool_fn(check_entailment)(premises, conclusion, vars)

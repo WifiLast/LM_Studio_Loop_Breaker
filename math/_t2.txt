@@ -1,6 +1,0 @@
-C:\Users\wiffzack\AppData\Local\Programs\Python\Python312\Lib\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (7.4.3)/charset_normalizer (3.4.4) doesn't match a supported version!
-  warnings.warn(
-x == 0 or x == 2 -> compiled OK
-x != 0 -> compiled OK
-
-single 'x != 0': {'ok': False, 'reason': 'Unable to parse constraints: invalid syntax (<unknown>, line 1)', 'suggestion': 'Use arithmetic or Z3-style logic with And/Or/Not/Implies.', 'status': 'invalid_expression'}

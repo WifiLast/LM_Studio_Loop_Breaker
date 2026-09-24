@@ -151,3 +151,15 @@ AUSGABE
   "suggestion": "Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
   "status": "invalid_expression"
 }
+
+Ergebnis von 2_z3_solve_constraints ansehen
+EINGABE
+constraints
+["0 <= boxA <= 2","0 <= boxO <= 2","0 <= boxM <= 2","boxA != 0","boxO != 1","boxM != 2","boxA != boxO","boxO != boxM","boxA != boxM","boxO == 2"]
+AUSGABE
+{
+  "ok": false,
+  "reason": "Unable to parse constraints: Symbolic expressions cannot be cast to concrete Boolean values.",
+  "suggestion": "Use arithmetic or Z3-style logic with And/Or/Not/Implies.",
+  "status": "invalid_expression"
+}
