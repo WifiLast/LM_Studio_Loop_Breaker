@@ -36,7 +36,7 @@ import sys
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from pydantic import BaseModel, Field
 
@@ -168,7 +168,7 @@ class PlannerConfig:
     auto_skip_plan_for_short_tasks: bool = True
     short_task_max_words: int = 20
     max_tasks: int = 20
-    task_result_limit: int = 6000
+    task_result_limit: int = 30000
     enable_review: bool = False
     request_timeout: float = 120.0
     verbose: bool = True
@@ -178,18 +178,39 @@ class PlannerConfig:
     mcp_servers: list = field(default_factory=list)
     max_tool_iterations: int = 6
     tool_result_limit: int = 4000
+    # How long a server's discovered tool list (and reachability) stays cached across
+    # requests. Every message would otherwise pay a fresh TCP check + MCP handshake even
+    # when no tool ends up being called; 0 disables the cache and re-discovers every time.
+    mcp_discovery_cache_ttl: float = 300.0
+    # Per-tool description length fed to the model as part of the `tools` schema. A
+    # server with many tools (each with a paragraph-long description) otherwise adds
+    # thousands of prompt tokens to every request that carries tools, whether or not
+    # the request needs any of them.
+    mcp_tool_description_limit: int = 200
+    # When Kev hasn't classified whether tools are needed (kev_ask_tools off, or no Kev
+    # at all), attaching every tool's schema to every request is expensive for a server
+    # with many tools. This gates on a cheap heuristic instead of always attaching them.
+    mcp_tool_gate_heuristic: bool = True
     # Loop detection thresholds per phase
     plan_loop_threshold: int = 2
     execution_loop_threshold: int = 3
     synthesis_loop_threshold: int = 2
     # Token budget awareness
-    max_tokens_per_task: int = 8000
+    max_tokens_per_task: int = 400000
     warn_at_percent: float = 0.8
     # Resume from memory
     enable_memory_resume: bool = True
+    # The task organizer (the decomposed plan and which tasks are done) persists across
+    # messages in the same chat, so a follow-up message continues the running plan
+    # instead of re-planning from scratch; task execution itself stays one-shot per task.
+    chat_plan_persist: bool = True
+    chat_plan_max_chats: int = 50
+    chat_plan_ttl: float = 3600.0
     # Kev (System One) decisions. Empty URL = off, and every call falls back to the
     # behaviour below it. See KevClient for why these three calls and not others.
-    kev_url: str = field(default_factory=lambda: os.getenv("KEV_URL", ""))
+    kev_url: str = field(
+        default_factory=lambda: os.getenv("KEV_URL", "http://10.0.0.10:8009")
+    )
     kev_api_key: str = field(default_factory=lambda: os.getenv("KEV_API_KEY", ""))
     kev_timeout: float = 30.0
     kev_state_limit: int = (
@@ -496,6 +517,24 @@ def _mcp_result_to_text(result: Any, limit: int = 4000) -> str:
 # Kev's answers per (endpoint, request), so a regenerate or a resent message pays nothing for its profile.
 _KEV_PROFILE_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
 
+
+@dataclass
+class ChatPlanState:
+    """The running plan for one chat: every task decomposed so far across turns, and
+    which are done. The organizer (this state) persists across messages in the same
+    chat; the workers that execute each task stay one-shot, created fresh per task as
+    before - only the plan itself accumulates."""
+
+    turn: int = 0
+    tasks: list = field(default_factory=list)  # list[Task], every turn's tasks appended
+    done: dict = field(default_factory=dict)  # task_id -> Task, across all turns
+    updated_at: float = field(default_factory=time.monotonic)
+
+
+# chat_id -> ChatPlanState, so a multi-turn chat's plan survives across pipe() calls
+# (each of which builds a brand-new StandalonePlanner). LRU-evicted like the Kev cache.
+_CHAT_PLAN_STORE: "OrderedDict[str, ChatPlanState]" = OrderedDict()
+
 # Every word of the message has to be one of these for it to count as small talk: "hi, what is 2+2" is a question.
 _SMALL_TALK_WORDS = frozenset("""
     hi hey hello hallo servus moin griaß grüß gruess gott di dich good morning afternoon evening night guten morgen
@@ -593,6 +632,31 @@ def _check_reachable(url: str, timeout: float = 2.0) -> None:
         raise ConnectionError(f"{parts.hostname}:{port} not reachable ({exc})") from exc
 
 
+# Discovered tool list (and reachability) per server config, so a message that never
+# ends up calling a tool doesn't pay a fresh TCP check + MCP handshake on every turn.
+# name -> (discovered_at, tools_dict | None, note | None); None tools_dict = server was
+# unreachable at discovery time, cached so repeat messages don't re-probe it either.
+_MCP_DISCOVERY_CACHE: dict[str, tuple[float, Optional[dict], Optional[str]]] = {}
+
+
+def _cached_mcp_tool_names(servers: list[dict], ttl: float) -> Optional[set[str]]:
+    """Tool names already known for `servers` from a previous connection, without opening
+    one now - or None if any server's entry is missing or stale, meaning the caller has
+    to connect to find out. Lets a decision like "is this worth connecting for" be made
+    before paying for a connection at all."""
+    now = time.monotonic()
+    names: set[str] = set()
+    for srv in servers:
+        name = srv.get("name") or srv.get("url") or "mcp"
+        cached = _MCP_DISCOVERY_CACHE.get(name)
+        if not cached or now - cached[0] >= ttl:
+            return None
+        _, tools, _ = cached
+        if tools:
+            names.update(tools.keys())
+    return names
+
+
 class MCPClient:
     """Connects to one or more MCP servers and exposes their tools.
 
@@ -603,15 +667,30 @@ class MCPClient:
 
     Gracefully degrades: if the `mcp` package is missing or a server cannot be
     reached, the affected server is skipped (with a note) rather than aborting.
+
+    Tool discovery (reachability + list_tools) is cached across requests for
+    `discovery_cache_ttl` seconds. A cache hit costs nothing: the actual server
+    connection is opened lazily, only if a tool call is made this run.
     """
 
-    def __init__(self, servers: list[dict], result_limit: int = 4000):
+    def __init__(
+        self,
+        servers: list[dict],
+        result_limit: int = 4000,
+        discovery_cache_ttl: float = 300.0,
+        tool_description_limit: int = 200,
+    ):
         self.servers = servers or []
         self.result_limit = result_limit
+        self.discovery_cache_ttl = discovery_cache_ttl
+        self.tool_description_limit = tool_description_limit
         self._stack: Any = None
         self.sessions: dict[str, Any] = {}
         # tool_name -> (server_name, openai_tool_schema)
         self.tools: dict[str, tuple] = {}
+        # server_name -> config, for servers whose tools came from cache and have not
+        # been connected yet in this run (lazily connected on the first call_tool).
+        self._unconnected: dict[str, dict] = {}
         self.notes: list[str] = []
 
     async def __aenter__(self) -> "MCPClient":
@@ -619,28 +698,45 @@ class MCPClient:
 
         self._stack = AsyncExitStack()
         await self._stack.__aenter__()
+        now = time.monotonic()
         for srv in self.servers:
             name = srv.get("name") or srv.get("url") or "mcp"
+            cached = _MCP_DISCOVERY_CACHE.get(name)
+            if cached and now - cached[0] < self.discovery_cache_ttl:
+                _, cached_tools, cached_note = cached
+                if cached_tools:
+                    self.tools.update(cached_tools)
+                    self._unconnected[name] = srv
+                elif cached_note:
+                    self.notes.append(cached_note)
+                continue
             try:
                 session = await self._connect(srv)
                 await session.initialize()
                 self.sessions[name] = session
                 listed = await session.list_tools()
+                server_tools: dict[str, tuple] = {}
                 for tool in listed.tools:
                     schema = tool.inputSchema or {"type": "object", "properties": {}}
-                    self.tools[tool.name] = (
+                    server_tools[tool.name] = (
                         name,
                         {
                             "type": "function",
                             "function": {
                                 "name": tool.name,
-                                "description": (tool.description or "")[:1024],
+                                "description": " ".join(
+                                    (tool.description or "").split()
+                                )[: self.tool_description_limit],
                                 "parameters": schema,
                             },
                         },
                     )
+                self.tools.update(server_tools)
+                _MCP_DISCOVERY_CACHE[name] = (now, server_tools, None)
             except Exception as exc:  # skip unreachable / misconfigured servers
-                self.notes.append(f"MCP server '{name}' unavailable: {exc}")
+                note = f"MCP server '{name}' unavailable: {exc}"
+                self.notes.append(note)
+                _MCP_DISCOVERY_CACHE[name] = (now, None, note)
         return self
 
     async def _connect(self, srv: dict) -> Any:
@@ -689,6 +785,15 @@ class MCPClient:
             return f"[unknown tool '{name}']"
         server_name = entry[0]
         session = self.sessions.get(server_name)
+        if session is None and server_name in self._unconnected:
+            srv = self._unconnected.pop(server_name)
+            try:
+                session = await self._connect(srv)
+                await session.initialize()
+                self.sessions[server_name] = session
+            except Exception as exc:
+                _MCP_DISCOVERY_CACHE.pop(server_name, None)
+                return f"[tool '{name}' server '{server_name}' connect failed: {exc}]"
         if session is None:
             return f"[tool '{name}' server '{server_name}' not connected]"
         try:
@@ -771,6 +876,38 @@ class StandalonePlanner:
             None  # False = keep the tools away from the model for this request
         )
         self._direct: bool = False  # simple request: answer without preamble
+        # Set from run()'s chat_id argument; None = no chat to persist the plan against.
+        self._chat_id: Optional[str] = None
+
+    def _get_chat_plan_state(self) -> Optional[ChatPlanState]:
+        """The running plan for this chat, or None if chat-plan persistence doesn't
+        apply (no chat_id, or turned off)."""
+        if not self.config.chat_plan_persist or not self._chat_id:
+            return None
+        now = time.monotonic()
+        state = _CHAT_PLAN_STORE.get(self._chat_id)
+        if state and now - state.updated_at >= self.config.chat_plan_ttl:
+            del _CHAT_PLAN_STORE[self._chat_id]
+            state = None
+        if state is None:
+            state = ChatPlanState()
+            _CHAT_PLAN_STORE[self._chat_id] = state
+        _CHAT_PLAN_STORE.move_to_end(self._chat_id)
+        while len(_CHAT_PLAN_STORE) > max(0, self.config.chat_plan_max_chats):
+            _CHAT_PLAN_STORE.popitem(last=False)
+        return state
+
+    def _namespace_new_tasks(self, tasks: list[Task], turn: int) -> list[Task]:
+        """Prefix this turn's task ids so they can't collide with an earlier turn's ids
+        in the same chat's accumulated plan, and rewrite related_tasks that pointed at
+        another task from this same turn to match."""
+        if turn <= 0:
+            return tasks
+        old_to_new = {t.task_id: f"t{turn}_{t.task_id}" for t in tasks}
+        for task in tasks:
+            task.task_id = old_to_new[task.task_id]
+            task.related_tasks = [old_to_new.get(r, r) for r in task.related_tasks]
+        return tasks
 
     async def _emit(self, message: str) -> None:
         if self._progress is not None:
@@ -1384,6 +1521,36 @@ class StandalonePlanner:
     )
     _LIST_ITEM_RE = re.compile(r"(^|\n)\s*(\d+[.)]|[-*])\s+\S")
 
+    _TOOL_META_QUERY_RE = re.compile(r"\b(mcp|tools?|capabilit\w*)\b", re.IGNORECASE)
+
+    def _looks_like_tool_meta_query(self, goal: str) -> bool:
+        """Is the request asking about the toolset itself (what's available, list them,
+        check them) rather than asking something that might incidentally need one? This
+        is a factual question with a deterministic answer (the discovered tool list), not
+        something Kev's "does this need a tool" classifier or the name heuristic should be
+        guessing about - both judge whether a tool helps the request's content, and a
+        request whose content IS the toolset is exactly the case they misjudge."""
+        return bool(self._TOOL_META_QUERY_RE.search(goal))
+
+    def _looks_like_it_needs_tools(
+        self, goal: str, names: Optional[Iterable[str]] = None
+    ) -> bool:
+        """Heuristic fallback for when Kev did not classify (no Kev, or kev_ask_tools off):
+        does the request plausibly need one of `names` (or, if omitted, the connected
+        tools)? Matches significant words from each tool's own name against the goal, so
+        it generalizes to whatever MCP servers happen to be configured instead of a
+        hardcoded keyword list."""
+        if names is None:
+            if self._mcp is None:
+                return False
+            names = self._mcp.tool_names
+        text = goal.lower()
+        for name in names:
+            for word in re.split(r"[_\-]+", name.lower()):
+                if len(word) >= 4 and word in text:
+                    return True
+        return False
+
     def _looks_like_short_task(self, goal: str) -> bool:
         """Heuristic: is this simple enough to answer directly, no plan needed?
 
@@ -1606,30 +1773,69 @@ class StandalonePlanner:
     def _make_mcp(self) -> Any:
         """Return an MCP client context manager (real if configured, else null)."""
         if self.config.mcp_servers and self.chat is not None:
-            return MCPClient(self.config.mcp_servers, self.config.tool_result_limit)
+            return MCPClient(
+                self.config.mcp_servers,
+                self.config.tool_result_limit,
+                self.config.mcp_discovery_cache_ttl,
+                self.config.mcp_tool_description_limit,
+            )
         return _NullMCP()
 
-    async def run(self, goal: str) -> PlannerResult:
-        start = time.monotonic()
-        # Kev's profile runs while the MCP servers connect (both mostly wait on I/O). The MCP context stays in this
-        # task: its anyio scopes must be entered and left in the same one.
-        tools_possible = bool(self.config.mcp_servers) and self.chat is not None
-        profile = asyncio.create_task(
-            self._profile_request(goal, tools_available=tools_possible)
+    def _mcp_worth_connecting(self, goal: str, tools_possible: bool) -> bool:
+        """Decided after Kev's profile, before paying for a connection: does this request
+        plausibly need a tool at all? Kev's own answer wins outright; otherwise this falls
+        back to the name heuristic against whatever is already cached (connecting once,
+        for an uncached server, to find out - after that its cache carries the answer).
+        """
+        if not tools_possible:
+            return False
+        if self._looks_like_tool_meta_query(goal):
+            return True
+        if self._tools_wanted is True:
+            return True
+        if self._tools_wanted is False:
+            return False
+        if not self.config.mcp_tool_gate_heuristic:
+            return True
+        cached_names = _cached_mcp_tool_names(
+            self.config.mcp_servers, self.config.mcp_discovery_cache_ttl
         )
-        await asyncio.sleep(
-            0
-        )  # let the Kev request start before the MCP import (~3 s the first time) holds the loop
-        mcp_cm = _NullMCP() if self._is_small_talk(goal) else self._make_mcp()
-        try:
-            async with mcp_cm as mcp:
-                await profile
-                return await self._run_connected(mcp, goal, start)
-        finally:
-            if not profile.done():
-                profile.cancel()
+        if cached_names is None:
+            return True  # cold cache: connect once so it gets discovered at all
+        return self._looks_like_it_needs_tools(goal, cached_names)
 
-    async def _run_connected(self, mcp: Any, goal: str, start: float) -> PlannerResult:
+    async def run(self, goal: str, chat_id: Optional[str] = None) -> PlannerResult:
+        start = time.monotonic()
+        self._chat_id = chat_id
+        if self._is_small_talk(goal):
+            await self._profile_request(goal, tools_available=False)
+            async with _NullMCP() as mcp:
+                return await self._run_connected(mcp, goal, start)
+
+        # Kev decides first - before any MCP connection or other work - whether this
+        # needs planning and whether it needs tools, so a simple, tool-free request never
+        # pays for either.
+        tools_possible = bool(self.config.mcp_servers) and self.chat is not None
+        await self._profile_request(goal, tools_available=tools_possible)
+
+        if self._mcp_worth_connecting(goal, tools_possible):
+            mcp_cm = self._make_mcp()
+            skipped_by_heuristic = False
+        else:
+            mcp_cm = _NullMCP()
+            skipped_by_heuristic = tools_possible
+        async with mcp_cm as mcp:
+            return await self._run_connected(
+                mcp, goal, start, skipped_by_heuristic=skipped_by_heuristic
+            )
+
+    async def _run_connected(
+        self,
+        mcp: Any,
+        goal: str,
+        start: float,
+        skipped_by_heuristic: bool = False,
+    ) -> PlannerResult:
         self._mcp = mcp
         for note in getattr(mcp, "notes", []) or []:
             await self._emit(note)
@@ -1644,6 +1850,12 @@ class StandalonePlanner:
             catalog = self._tools_catalog_text()
             if catalog:
                 await self._emit("Available MCP tools:\n" + catalog)
+        elif skipped_by_heuristic:
+            # We deliberately didn't connect - not a failure, just judged unnecessary.
+            await self._emit(
+                "MCP configured but not connected: this request didn't look like it "
+                "needed a tool."
+            )
         elif configured:
             # Servers were configured but no tools were discovered: tell the
             # user explicitly instead of failing silently.
@@ -1668,10 +1880,19 @@ class StandalonePlanner:
         if skip_plan:
             await self._emit("Single-pass execution (plan mode off)")
             single = Task(task_id="task_1", description=goal)
+            gate_open = (
+                self._looks_like_tool_meta_query(goal)
+                or self._tools_wanted is True
+                or (
+                    self._tools_wanted is None
+                    and (
+                        not self.config.mcp_tool_gate_heuristic
+                        or self._looks_like_it_needs_tools(goal)
+                    )
+                )
+            )
             tools = (
-                self._mcp.openai_tools()
-                if self._mcp is not None and self._tools_wanted is not False
-                else []
+                self._mcp.openai_tools() if self._mcp is not None and gate_open else []
             )
 
             # Inject time context
@@ -1701,17 +1922,27 @@ class StandalonePlanner:
                 goal, [single], single.result, time.monotonic() - start
             )
 
-        tasks = await self.plan(goal)
+        chat_state = self._get_chat_plan_state()
+        done: dict[str, Task] = dict(chat_state.done) if chat_state else {}
+        if done:
+            await self._emit(
+                f"Continuing this chat's plan: {len(done)} previously completed "
+                "task(s) carried over"
+            )
 
-        # Try to resume from memory first
-        done: dict[str, Task] = {}
-        if self.config.enable_memory_resume:
+        tasks = await self.plan(goal)
+        if chat_state is not None:
+            chat_state.turn += 1
+            tasks = self._namespace_new_tasks(tasks, chat_state.turn)
+
+        # Try to resume from memory next (only for whatever the chat-plan state didn't
+        # already cover - it's the more precise, always-available source).
+        if not done and self.config.enable_memory_resume:
             resumed = await self._resume_from_memory(goal)
             if resumed:
                 done = resumed
                 await self._emit(f"Resumed {len(done)} completed task(s) from memory")
-                # Filter out resumed tasks from execution
-                tasks = [t for t in tasks if t.task_id not in done]
+        tasks = [t for t in tasks if t.task_id not in done]
 
         for task in tasks:
             try:
@@ -1766,10 +1997,14 @@ class StandalonePlanner:
                 await self._emit(f"{task.task_id} failed: {exc}")
             done[task.task_id] = task
 
+        if chat_state is not None:
+            chat_state.tasks.extend(tasks)
+            chat_state.done.update(done)
+            chat_state.updated_at = time.monotonic()
+
         if (
             self.config.skip_single_task_synthesis
             and len(tasks) == 1
-            and len(done) == 1
             and tasks[0].status == "completed"
             and tasks[0].result.strip()
         ):
@@ -2211,6 +2446,18 @@ class Pipe:
             default=4000,
             description="Per tool-result character limit fed back to the model.",
         )
+        MCP_DISCOVERY_CACHE_TTL: float = Field(
+            default=300.0,
+            description="Seconds an MCP server's discovered tool list stays cached across messages, so a message that never calls a tool skips the reachability check + handshake. 0 disables the cache.",
+        )
+        MCP_TOOL_DESCRIPTION_LIMIT: int = Field(
+            default=200,
+            description="Max characters of each tool's description sent to the model as part of its tool schema. Lower this if a server exposes many tools with long descriptions and requests feel slow even when no tool ends up being called.",
+        )
+        MCP_TOOL_GATE_HEURISTIC: bool = Field(
+            default=True,
+            description="When Kev hasn't classified whether tools are needed, only attach tool schemas to a request when its text plausibly matches a connected tool's name. Disable to always attach every tool (slower with many tools, but never risks missing one on an oddly-worded request).",
+        )
         PLAN_MODE: bool = Field(
             default=True,
             description="Decompose into tasks first. Disable for a single-pass answer.",
@@ -2231,11 +2478,19 @@ class Pipe:
         ENABLE_REVIEW: bool = Field(
             default=False, description="Add a final self-review/refine pass."
         )
+        CHAT_PLAN_PERSIST: bool = Field(
+            default=True,
+            description="Keep a chat's decomposed plan (tasks and which are done) alive across messages in the same chat, so a follow-up continues the running plan instead of re-planning from scratch. Task execution itself is unaffected - still one-shot per task.",
+        )
+        CHAT_PLAN_TTL: float = Field(
+            default=3600.0,
+            description="Seconds a chat's plan stays cached with no new message before it's dropped.",
+        )
         EMIT_STATUS: bool = Field(
             default=True, description="Emit progress as status updates in the UI."
         )
         KEV_URL: str = Field(
-            default="",
+            default="http://10.0.0.10:8009",
             description="Kev System One endpoint (e.g. http://127.0.0.1:8009). Empty = no typed decisions, the planner behaves as before.",
         )
         KEV_API_KEY: str = Field(
@@ -2703,6 +2958,9 @@ class Pipe:
             mcp_servers=mcp_servers,
             max_tool_iterations=valves.MAX_TOOL_ITERATIONS,
             tool_result_limit=valves.TOOL_RESULT_LIMIT,
+            mcp_discovery_cache_ttl=valves.MCP_DISCOVERY_CACHE_TTL,
+            mcp_tool_description_limit=valves.MCP_TOOL_DESCRIPTION_LIMIT,
+            mcp_tool_gate_heuristic=valves.MCP_TOOL_GATE_HEURISTIC,
             kev_url=valves.KEV_URL,
             kev_api_key=valves.KEV_API_KEY,
             kev_decide_planning=valves.KEV_DECIDE_PLANNING,
@@ -2716,6 +2974,8 @@ class Pipe:
             model_can_think=can_think,
             kev_check_tasks=valves.KEV_CHECK_TASKS,
             kev_gate_review=valves.KEV_GATE_REVIEW,
+            chat_plan_persist=valves.CHAT_PLAN_PERSIST,
+            chat_plan_ttl=valves.CHAT_PLAN_TTL,
             verbose=False,
         )
         planner = StandalonePlanner(
@@ -2752,8 +3012,14 @@ class Pipe:
             except Exception:
                 pass
 
+        chat_id = None
+        if isinstance(__metadata__, dict):
+            chat_id = __metadata__.get("chat_id") or __metadata__.get("session_id")
+        if not chat_id:
+            chat_id = body.get("chat_id")
+
         try:
-            result = await planner.run(goal)
+            result = await planner.run(goal, chat_id=chat_id)
         except Exception as exc:
             if __event_emitter__ and valves.EMIT_STATUS:
                 await __event_emitter__(

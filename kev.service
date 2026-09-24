@@ -1,0 +1,15 @@
+[Unit]
+Description=Kev System One server (kev.serve, Ollama backend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wiffzack
+WorkingDirectory=/home/wiffzack/llm/kev
+ExecStart=/home/wiffzack/llm/kev/run_kev.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
