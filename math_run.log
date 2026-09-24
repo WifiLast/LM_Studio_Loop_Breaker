@@ -1,0 +1,371 @@
+
+qwen-hauhaucs:latest
+Untersucht 6 2_integrate_function, 6 2_evaluate
+
+Gedanke
+Ergebnis von 2_integrate_function ansehen
+Eingabe
+expression
+np.log(x)/(x**2+1)**2
+lower
+1e-9
+upper
+1000
+Ausgabe
+{
+  "value": -0.7853981274858949,
+  "abserr": 8.628576253499887e-8
+}
+Ergebnis von 2_integrate_function ansehen
+Eingabe
+expression
+np.log(x)/(x**2+4)**2
+lower
+1e-9
+upper
+1000
+Ausgabe
+{
+  "value": -0.030125205983853875,
+  "abserr": 2.6181136147940265e-9
+}
+Ergebnis von 2_integrate_function ansehen
+Eingabe
+expression
+np.log(x)/(x**2+7.38905609893065)**2
+lower
+1e-9
+upper
+1000
+Ausgabe
+{
+  "value": -2.223122772909476e-9,
+  "abserr": 4.2687037340557536e-10
+}
+Ergebnis von 2_integrate_function ansehen
+Eingabe
+expression
+(x**2+1)**(-2)
+lower
+0
+upper
+1000
+Ausgabe
+{
+  "value": 0.7853981630641153,
+  "abserr": 2.0732948283273388e-10
+}
+Ergebnis von 2_evaluate ansehen
+Eingabe
+expression
+3.141592653589793/4
+Ausgabe
+{
+  "ok": true,
+  "reason": "Expression evaluated successfully.",
+  "suggestion": "",
+  "value": 0.7853981633974483,
+  "status": "value_computed"
+}
+Ergebnis von 2_evaluate ansehen
+Eingabe
+expression
+(3.141592653589793*(0.6931471805599453 - 1))/32
+Ausgabe
+{
+  "ok": true,
+  "reason": "Expression evaluated successfully.",
+  "suggestion": "",
+  "value": -0.030125205102693474,
+  "status": "value_computed"
+}
+
+Gedanke
+Ergebnis von 2_integrate_function ansehen
+Eingabe
+expression
+np.log(x)/(x**2+0.25)**2
+lower
+1
+upper
+500
+Ausgabe
+{
+  "value": 0.09429897971370833,
+  "abserr": 2.576991209311004e-12
+}
+Ergebnis von 2_evaluate ansehen
+Eingabe
+expression
+(3.141592653589793/4)*(np.log(0.5)-1)/0.125
+Ausgabe
+{
+  "ok": true,
+  "reason": "Expression evaluated successfully.",
+  "suggestion": "",
+  "value": -10.638357487786791,
+  "status": "value_computed"
+}
+Ergebnis von 2_evaluate ansehen
+Eingabe
+expression
+0.5*2.079146848974311*0.3577368600229357
+Ausgabe
+{
+  "ok": true,
+  "reason": "Expression evaluated successfully.",
+  "suggestion": "",
+  "value": 0.37189373263932546,
+  "status": "value_computed"
+}
+
+Gedanke
+Ergebnis von 2_integrate_function ansehen
+Eingabe
+expression
+np.log(x)/(x**2+0.25)**2
+lower
+1e-12
+upper
+1000
+Ausgabe
+{
+  "value": -10.638357490007945,
+  "abserr": 1.7782708638947042e-8
+}
+Ergebnis von 2_evaluate ansehen
+Eingabe
+expression
+(3.141592653589793/4)*(np.log(0.5)-1)/0.125
+Ausgabe
+{
+  "ok": true,
+  "reason": "Expression evaluated successfully.",
+  "suggestion": "",
+  "value": -10.638357487786791,
+  "status": "value_computed"
+}
+Ergebnis von 2_evaluate ansehen
+Eingabe
+expression
+(3.141592653589793/4)*(np.log(3)-1)/27
+Ausgabe
+{
+  "ok": true,
+  "reason": "Expression evaluated successfully.",
+  "suggestion": "",
+  "value": 0.002868515200309349,
+  "status": "value_computed"
+}
+
+Für weniger als eine Sekunde nachgedacht
+Closed form of I(a) = ∫₀^∞ ln(x)/(x² + a²)² dx
+Step 1 — Reduction to a = 1 (x → ax)
+Let x = at, dx = a dt:
+
+I(a) = ∫₀^∞ ln(at) / (a²t² + a²)² a dt = (1/a³) ∫₀^∞ [ln a + ln t] / (1 + t²)² dt
+= (ln a)/a³ ∫₀^∞ dt/(1+t²)² + (1/a³) ∫₀^∞ ln t/(1+t²)² dt
+
+So I(a) = (ln a)/a³ · A + B/a³, where A = ∫₀^∞ dt/(1+t²)² (a known elementary integral) and B is the a = 1 case.
+
+A: dt/(1+t²)² with t = tan θ gives ∫₀^(π/2) cos² θ dθ = π/4. ✓
+
+Step 2 — B via Method A (Mellin/Beta, with the substitution t = eᵘ)
+Define F(s) = ∫₀^∞ x^(s−1)/(1+x²)² dx, valid for 0 < s < 3.
+
+Write the integrand and split:
+F(s) = ∫₀^∞ x^(s−1)(1+x²)⁻¹ (1+x²)⁻¹ dx = B(s) − E(s),
+where B(s) = ∫₀^∞ x^(s−1)/(1+x²) dx and E(s) = ∫₀^∞ x^s/(1+x²)² dx.
+
+Beta reduction. With u = x²/(1+x²) (so x² = u/(1−u), dx/x = du/(2u(1−u))):
+
+B(s) = (1/2) ∫₀¹ u^(s/2−1)(1−u)^(−s/2) du = (1/2) B(s/2, 1 − s/2) = (1/2) π/sin(πs/2)
+
+E(s) = (1/2) ∫₀¹ u^(s/2)(1−u)^(−s/2−1) du = (1/2) B(s/2 + 1, −s/2) = (−1/2) π/sin(πs/2) · (1 − s/2) (principal value, valid by analytic continuation).
+
+Therefore **F(s) = (1/2) π/sin(πs/2) · (s/2 − 1 + 1) = (1/2) π/sin(πs/2) · ... ** — more cleanly: since B − E = (1/2)(π/sin)(1 − (1−s/2)) = (1/2)(π/sin)(s/2):
+
+**F(s) = π/s² · s/(2 sin(πs/2)) = (π/(2s)) sec... ** no: F(s) = (π/(2s))·(1/sin(πs/2))·(s/2)·2/2 =
+
+F(s) = π/s² · (s/2)·(2/ (2 sin)) → F(s) = π/(s²)·(s/2)/(1/2 · 2/2)...
+
+Straight forward: B(s) − E(s) = (1/2)(π/sin)(s/2) = π/(4 · (2/s) sin(πs/2)) ... simply:
+
+F(s)= 
+s 
+2
+ 
+π
+​
+ ⋅ 
+2
+s
+​
+ ⋅ 
+π
+2
+​
+ ⋅ 
+...
+1
+​
+ 
+Cleanest closed statement: F(s) = (π/s²)·(s/2)·(2/(2 sin)) = (π/s)·(1/sin(πs/2))·(s/2)·(1/1) i.e.
+
+F(s)= 
+2
+1
+​
+  
+sin(πs/2)
+π
+​
+ ⋅ 
+2
+s
+​
+ = 
+4sin(πs/2)
+πs
+​
+ 
+Wait — that can't be: as s→0, F(s)→0 ✓ (integrand x^(−1)/(1+x²)² PV... actually F(0)=0 since ∫₀∞ x⁻¹/(1+x²)² = 0 by the symmetry u↦1/u... check numerically below), and π s/4 sin(πs/2) → 1/2 as s→0. Let me check numerically: s→0 limit gives 1/2? ∫₀∞ x⁻¹/(1+x²)² dx: split at 1, substituting x→1/x in (1,∞): ∫₁∞ x⁻¹/(1+x²)² dx = ∫₀¹ x³/(1+x²)² dx = ∫₀¹ (x⁻¹ − x³/(1+x²))... total = ∫₀¹ [x⁻¹(1+x²)⁻² + x⁻¹(1+x²)⁻²]·x²... = 0 by antisymmetry under x↦1/x? Under x→1/x: integrand g(x)=x⁻¹(1+x²)⁻² maps to (1/x)·(x⁴/(1+x²)²)·(1/x²)=x⁻¹(1+x²)⁻² = g(x), invariant → integral over (0,1) equals that over (1,∞), sum = 2∫₀¹ ≠ 0... I'll trust the numerical check.
+
+The differentiation is the delicate part; let me compute it carefully rather than gloss over:
+
+F(s) = (1/2)(s/2)π csc(πs/2) = (π s/4) csc(πs/2)
+
+ln F(s) = ln(π/4) + ln s − ln(2s/sin(πs/2)·(1/(1)))... use t = πs/2: F = (t/2)/sin t · (1/...
+
+Set G(s) = ln F(s) = ln(π/4) + ln s − ln(sin(πs/2)). Then
+
+G'(1) = 1 − (π/2)·[cos(π/2)/sin(π/2)] = 1 (since the csc factor's derivative vanishes at s=1: cot(π/2)=0).
+
+Therefore F(1)' = F(1)·G'(1) = F(1)·1, with F(1) = π/4.
+
+So B = F(1)' = π/4?? But the numerical integral gave −0.7854 for a = 1. Contradiction — the sign. The numerical result is −π/4. Let me recheck G'(1): F(s) = (π/4)(s/2·...
+
+F(s) = (1/2)(π/sin(πs/2))(s/2)·2 = (π s)/(2 sin(πs/2))·(1/1)? From B−E = (1/2)(π/sin)·(s/2)·(1/(1))... B = (1/2)(π/sin), E = (1/2)(π/sin)(1−s/2): B−E = (1/2)(π/sin)(s/2). So F(s) = (π s)/(4 sin(πs/2)). At s=1: π/4 ✓. ln F = ln(π/4) + ln s − ln sin(πs/2). d/ds[−ln sin(πs/2)] = −(π/2) cot(πs/2); at s=1: −(π/2)·0 = 0. G'(1) = 1. So F'(1) = π/4 > 0.
+
+Numerical says negative. So somewhere the sign of E's Beta integral is wrong: E(s) = (1/2)∫₀¹ u^(s/2)(1−u)^(−s/2−1) du. Beta form B(p,q) requires q>0 for convergence; here q = −s/2 < 0, so this is a divergent (PV) integral and its analytic continuation is −(1/2) π/sin(πs/2)·(1−s/2)? Let me verify F(1) directly by splitting: F(1) = ∫₀∞ 1/(1+x²)² dx = π/4 ✓ matches. And the expansion: 1/(1+x²)² = (1/(1+x²)) − (x²/(1+x²)²)... actually (1+x²)⁻² = (1+x²)⁻¹ − x²(1+x²)⁻², so E = F — tautology. Non-tautological: 1/(1+x²)² = 1/(1+x²) − x²/(1+x²)² → F = B − E is tautological. OK so the real check is whether F'(1) is + or − π/4. Numerically: F(1+ε) = ∫ x^ε/(1+x²)². Expand: ln x^ε = ε ln x. F(1+ε) ≈ F(1) + ε F'(1). Numerical quad at a=1 gave F(1) = −0.7854?? No wait — the first integral was ∫ ln x/(x²+1)² = −0.7853981..., which equals F(1) if F(1) = ... F(s)=∫ x^(s−1)/(1+x²)², F(1) = ∫ 1/(1+x²)² = +0.7854 = π/4 ✓. The integral of ln x/(1+x²)² = F'(1)·... F'(1) = ∫ x^(1−1) ln x/(1+x²)² = ∫ ln x/(1+x²)² ✓ = numerically −0.7853981274 = −π/4.
+
+So F'(1) = −π/4, meaning G'(1) = −1, meaning d/ds[−ln sin(πs/2)] at 1 = −1?? cot(π/2) = 0 kills that term... unless F(s) = πs/(4 sin(πs/2)) is wrong and the correct value is F(s) = (π/4)(1−...
+
+Let me test F(s) numerically at s=2: ∫ x/(1+x²)² dx = [−1/(2(1+x²))]₀∞ = 1/2. Formula π·2/(4 sin π) = ∞ ✗ — the formula has a singularity at s=2 but F(2) = 1/2 finite, so the formula is simply wrong at s=2... because the PV prescription at the pole is what fixes it: near s=2, (1/2)(π/sin)(s/2) blows up but B and E blow up separately and their finite parts combine. B(s) itself is fine (B(2)=1/2), so the issue is purely in my E. Redo E(s) = ∫₀∞ x^s/(1+x²)² dx with u = x²/(1+x²): x² = u/(1−u), x^s dx = ... x = (u/(1−u))^(1/2), dx = (1/2)(u(1−u))^(−1/2)(u(1−u))⁻...
+
+E(s) = ∫₀∞ x^s/(1+x²)² dx. u=x²/(1+x²), x² = u/(1−u), 2x dx = (u/(1−u))' dx → x dx = (1/2) d(u/(1−u)) = (1/2) du/((1−u)² · ... d(u/(1−u)) = du/(1−u)² + u du/(1−u)² = du/(1−u)². So x dx = du/(2(1−u)²). x^s = (u/(1−u))^(s/2). (1+x²)² = (1/(1−u))². Integrand: (u/(1−u))^(s/2) · (1−u)² · du/(2(1−u)²) = (1/2)(u/(1−u))^(s/2) du. E(s) = (1/2)∫₀¹ u^(s/2)(1−u)^(−s/2) du = (1/2) B(s/2, 1−s/2) = (1/2)(π/sin(πs/2))·( (1−s/2−1)??
+
+B(p,q) = Γ(p)Γ(q)/Γ(p+q), with p = s/2, q = 1−s/2 (I made an algebra slip earlier: exponent (1−u)^(−s/2) means q−1 = −s/2, q = 1−s/2 ✓). E(s) = (1/2)B(s/2, 1−s/2) = (1/2)(π/sin(πs/2))·( (−1/2...
+
+B(s/2, 1−s/2) = (s/2)(1−s/2)B... no: B(p,q) = (1/2)(π/sin(πs/2)) uses Γ(s/2)Γ(1−s/2)/Γ(1/2) with p+q = 1. Γ(s/2)Γ(1−s/2) = π/sin(πs/2) ✓. So E(s) = (1/2)π/sin(πs/2), identical to B(s)?? Check numerically: E(1) = ∫ x/(1+x²)² = 1/2 ✓ and (1/2)π/sin(π/2) = π/2 ✗. So E(1) = 1/2 ≠ π/2. Error: E(s) formula at s=1: B(1/2, 1/2) = π, ×1/2 = π/2 ✗. So the substitution for E is wrong. (1+x²)² = (1/(1−u))² → reciprocal is (1−u)², x^s dx = (u/(1−u))^(s/2)·du/(2(1−u)²). Product: (1/2)(u/(1−u))^(s/2)(1−u)^(−... (1−u)²·(1−u)⁻² = 1. E = (1/2)∫ u^(s/2)(1−u)^(−s/2) du ✓ = (1/2)B(s/2, 1−s/2) ✓. But numerically E(1): ∫₀∞ x/(1+x²)² dx = 1/2. And (1/2)B(1/2,1/2) = (1/2)(Γ(1/2)²/Γ(1)) = π/2 ≈ 1.5708. Contradiction → substitution error. u = x²/(1+x²): at x→∞, u→1. x² = u/(1−u) ✓. 1+x² = 1/(1−u) ✓. (1+x²)² = 1/(1−u)², reciprocal = (1−u)² ✓. x^s = u^(s/2)(1−u)^(−s/2) ✓. x dx: x = (u/(1−u))^(1/2); ln x = (1/2)(ln u − ln(1−u)); dx/dx... dx = (1/4)(u(1−u))^(−1/2)( (1−u) + u) u⁻... differentiate (u/(1−u))^(1/2): d/du ln(u/(1−u)) = 1/u + 1/(1−u). dx = (1/2)(u/(1−u))^(−1/2)·(u/(1−u)) · d(u/(1−u))... simpler: x dx = (1/2)d(x²) = (1/2)d(u/(1−u)) = (1/2)·(1/(1−u)²) du ✓. So E = (1/2)∫₀¹ u^(s/2)(1−u)^(−s/2) du. At s=1: (1/2)∫₀¹ (1−u)^(−1/2) du = (1/2)·2 = 1 ✗ (should be 1/2)?? ∫₀¹ (1−u)^(−1/2) du = [−2(1−u)^(1/2)]₀¹ = 2. Half → 1. But direct: ∫₀∞ x/(1+x²)² dx = 1/2. So u-substitution gives 1. Test at x=1: u = 1/2. Direct integrand at x=1: 1/4. Transform integrand: (1/2)(1−u)^(−1/2) at u=1/2: (1/2)(2)^(1/2) = 0.7071. dx at x=1: dx/du = (1/4)u⁻¹(1−u)⁻²... x dx formula at x=1: (1/2)(1−1/2)⁻² = (1/2)(4) = 2; x^s/(1+x²)² = 1/4 → 0.5 vs 0.7071. So x dx = du/(2(1−u)²) is wrong: d(u/(1−u)) = [ (1−u) + u ]/(1−u)² du = 1/(1−u)² du ✓ so x dx = du/(2(1−u)²) ✓. At x=1: du/dx²... u = x²/(1+x²), du = 2x(1+x²)⁻²·... du/dx = 2x(1+x²)⁻²... at x=1: 2/4 = 1/2, so dx = du/(1/2) = 2du, x dx = 2x dx = 4 du → x dx/du = 4 = (1/2)(1−u)⁻²·... (1/2)(4) = 2 ✗ 4. (1−u)⁻² at u=1/2 = 4, ×1/2 = 2, but need 4 → x dx = du/(2(1−u)²)·...
+
+x dx = (1/2)(1−u)⁻² du would give at u=1/2: (1/2)(4) = 2, need 4. So x dx = (1−u)⁻² du? Check: (1/2)d(u/(1−u)): d(u/(1−u))/du = (1−u + u)/(1−u)² = 1/(1−u)² ✓ so (1/2)(1−u)⁻²... that's what I had: (1/2)(1−u)⁻². At u=1/2: (1/2)·4 = 2. But needed 4 → contradiction → x dx = (1/2)(1−u)⁻² du is correct by algebra, so needed 4 must be wrong: x=1, u=1/2, du/dx = 2x/(1+x²)² = 2/4 = 1/2 → dx/du = 2 → x dx/du = 1·2 = 2 ✓. My "4" was wrong (wrote 4du where 2·1... x dx = x·(2du) = 2 du ✓). So formula gives 2 ✓. Then transformed integrand at u=1/2: x^s/(1+x²)² · dx = (1/4)(2 du) = 0.5 du. Formula (1/2)(1−u)^(−s/2) du at s=1: (1/2)(2)^(1/2) = 0.707 ✗ 0.5. So (1+x²)² reciprocal: 1+x² = 1/(1−u) ✓ → (1+x²)⁻² = (1−u)² ✓... x^s/(1+x²)² = u^(s/2)(1−u)^(−s/2)·(1−u)² ✓. At s=1,u=1/2: (1/2)(2)^(1/2)·(1/2)² = 0.7071·0.25 = 0.1768, ×(1/2)...
+
+x^s/(1+x²)² · dx: at s=1: x/(1+x²)²·dx = (1/4)(2du) = 1/2 du. Formula: (1/2)u^(1/2)(1−u)^(1/2) du (since −s/2+2 = 1/2 for s=1) at u=1/2: (1/2)(0.5) du = 0.25 du ✗ 0.5. So exponent on (1−u): (1+x²)⁻² → (1−u)², ×(1−u)^(−s/2) → total (1−u)^(2−s/2). I wrote (1−u)^(−s/2) — dropped the (1−u)² from (1+x²)⁻²?? I said reciprocal = (1−u)² ✓ and then "product: ... (1−u)²·(1−u)⁻² = 1" — that cancelled with the (1−u)² from dx! Both (1+x²)⁻² → (1−u)² AND dx → (1−u)⁻². Product of (1−u)² (from denominator) and (1−u)⁻² (from dx) = 1, leaving (1−u)^(−s/2). That's what I had... at u=1/2, s=1: (1/2)(u/(1−u))^(1/2) = (1/2)(1) = 1/2 per formula, but direct 1/4·2 = 1/2. Formula integrand (1/2)(u/(1−u))^(1/2) du: at u=1/2: (1/2)(1)(du) = 0.5 ✓✓. I miscalculated (0.7071 came from misreading (u/(1−u))^(s/2) as u^(s/2)(1−u)^(−s/2)·... (u/(1−u))^(1/2) at u=1/2 = (1)^(1/2) = 1 ✓, so (1/2)(1) = 1/2 ✓ direct ✓. My error: (u/(1−u))^(s/2) ≠ u^(s/2)(1−u)^(−s/2)·... it is: (u/(1−u))^(1/2) = u^(1/2)(1−u)^(−1/2) = (0.5)(0.5)^(−1/2) = (0.5)(1.414) = 0.7071 ≠ 1. Contradiction: (u/(1−u)) at u=1/2 is 1, sqrt = 1. u^(1/2)(1−u)^(−1/2) = 0.7071·1.4142 = 1 ✓ (0.5·... (0.5)^0.5·(0.5)^(−0.5) = (0.5)^(0.5−0.5) = 0.5^0 = 1 ✓. I computed 0.7071·1.4142 = 1 ✓. OK so E(s) = (1/2)∫ u^(s/2)(1−u)^(−s/2)·...
+
+E(s) = (1/2)∫₀¹ u^(s/2)(1−u)^(−s/2) du = (1/2)B(s/2, 1−s/2) ✓. At s=1: (1/2)B(1/2, 1/2) = (1/2)π = 1.5708. Direct: ∫₀∞ x/(1+x²)² dx = 1/2. Check substitution numerically: transform at u=0.5 is 0.5, ∫₀¹ (1/2)(u/(1−u))^(1/2) du = (1/2)B(1/2,1/2) = (1/2)π. Direct: 1/2. So the u-substitution for E(s) must be wrong. u = x²/(1+x²), s=1: E = ∫₀∞ x(1+x²)⁻² dx. Transform: (1/2)∫ u^(1/2)(1−u)^(−1/2) du. Numerically ∫₀¹ u^0.5(1−u)^−0.5 du = B(0.5, 0.5) = π. Half → π/2. Direct 0.5. So transformation is definitely wrong somewhere. Redo dx/du: u = x²/(1+x²). 1−u = 1/(1+x²). u/(1−u) = x² ✓. du = [ (1+x²) − x²·2x ]/(1+x²)² dx = (1−x²)/(1+x²)² dx. dx = (1+x²)²/(1−x²) du. x = (u/(1−u))^(1/2). x dx = (u/(1−u))^(1/2)·(1+x²)²/(1−x²) du = (u/(1−u))^(1/2)·(1−u)⁻²·(1−x²)⁻¹... 1−x² = 1−2u/(1−u)·... 1−x² = (1−2u)/(1−u)·... x² = u/(1−u) → 1−x² = (1−2u)/(1−u)?? (1−u−u)/(1−u) = (1−2u)/(1−u). Hmm but also 1−x² = (1−x²)... at u=1/2 (x=1): 1−x² = 0 → dx/du = ∞ ✓ (du/dx = 0 at x=1). x dx = (u/(1−u))^(1/2)·(1+x²)²/(1−x²)·... but (1+x²)² du = (1+x²)²·2x(1+x²)⁻²... du = 2x(1+x²)⁻²·... du = [2x(1+x²) − x²·2x]/(1+x²)² dx = 2x/(1+x²)² dx → (1+x²)² du = 2x dx → x dx = (1+x²)du/2 = (1−u)⁻¹ du/2. There we go: x dx = du/(2(1−u)), not (1−u)⁻²! (I erroneously used d(u/(1−u)) but u itself, not u/(1−u), is the variable with du.) So:
+
+E(s) = (1/2)∫₀¹ u^(s/2)(1−u)^(−s/2)·(1−u)^(−1)·... (1+x²)⁻² = (1−u)², × (1−u)^(−s/2) [from x^s] × du/(2(1−u)) = (1/2)∫ u^(s/2)(1−u)^(1−s/2) du = (1/2) B(s/2, 3/2−s/2)·... exponents: u: s/2 → p = s/2+1 (u^(p−1) = u^(s/2) → p−1 = s/2, p = s/2+1). (1−u): exponent (1−s/2)−1... integrand (1−u)^(1−s/2), so q−1 = 1−s/2−1+1... (1−u)^(1−s/2) du: q−1 = 1−s/2 → q = 2−s/2. Hmm: (1/2)∫₀¹ u^(s/2)(1−u)^(1−s/2) du, p−1 = s/2 → p = s/2+1; q−1 = 1−s/2 → q = 2−s/2. E(s) = (1/2)B(s/2+1, 2−s/2).
+
+Check E(1) = (1/2)B(3/2, 3/2) = (1/2)Γ(3/2)²/Γ(3) = (1/2)(π/4) = π/8 = 0.3927 ✗ (need 1/2). Hmm. Direct integral: ∫₀∞ x/(1+x²)² dx, w = 1+x²: ∫₁∞ dw/w² = 1/2. E(1) = 1/2. Formula (1/2)B(3/2, 3/2) = (1/2)(Γ(3/2)²/Γ(3)) = (1/2)((√π/2)²/2) = (1/2)(π/4)/... Γ(3/2) = √π/2, squared = π/4, Γ(3) = 2, so B = π/8, half → π/16 = 0.196. ✗. So the transformation is still wrong. u-sub for E: (1+x²)⁻² = (1−u)². x^s = (u/(1−u))^(s/2). x dx = du/(2(1−u)). Integrand·dx: (1/2) u^(s/2)(1−u)^(−s/2)(1−u)²(1−u)⁻¹ du = (1/2)u^(s/2)(1−u)^(1−s/2) du. At s=1: (1/2)∫₀¹ u^(1/2)(1−u)^(1/2) du = (1/2)B(3/2, 3/2) = (1/2)(π/4)·(1/1)... B(3/2,3/2) = Γ(3/2)²/Γ(3) = (π/4)/2 = π/8. Half: π/16 = 0.1963. Direct: 0.5.
+
+I must be making a systematic error; let me verify E(1) substitution pointwise: x=1 (u=1/2): integrand·dx: x(1+x²)⁻² dx = (1)(1/4)(dx). dx = du/(1/2) = 2du (du/dx = 2x(1+x²)⁻²·(1)·... du/dx = 2x/(1+x²)² at x=1 = 2/4 = 1/2 → dx = 2 du. So integrand·dx = (1/4)(2) = 1/2 du. Formula (1/2)u^(1/2)(1−u)^(1/2) at u=1/2: (1/2)(1/2) = 1/4 ✗ 1/2. Factor of 2 off everywhere → x dx = du/(2(1−u)) is wrong: dx = du/(du/dx) = du·(1+x²)²/(2x) → x dx = (1+x²)²/(2x)·x du = (1+x²)²/(2) du·... = (1−u)⁻²/2·... (1+x²)²/(2) du = (1−u)⁻²/2 du ✗. Ugh: x dx = x·(1+x²)²/(2x) du = (1+x²)²/2 du = (1−u)⁻²/2 du. So x dx = du/(2(1−u)²) ✓ (original was right). Then integrand·dx = (u/(1−u))^(s/2)·(1−u)²·(1/2)(1−u)⁻² du = (1/2)u^(s/2)(1−u)^(−s/2) du. At s=1, u=1/2: (1/2)(1)(1) = 1/2 ✓✓✓ (direct 1/2 ✓). And ∫₀¹ (1/2)(u/(1−u))^(1/2) du = (1/2)B(3/2, −1/2)·... u^(1/2)(1−u)^(−1/2): p = 3/2, q = 1/2: B(3/2,1/2) = Γ(3/2)Γ(1/2)/Γ(2) = (√π/2)(√π)/1 = π/2. Half → π/4 = 0.785 ✗ direct 0.5. Pointwise matches (1/2 du at u=1/2) but integrals don't → pointwise: formula (1/2)(u/(1−u))^(1/2) du at u=1/2 = (1/2)(1) du ✓. Integral (1/2)∫₀¹ u^(1/2)(1−u)^(−1/2) du = (1/2)[−2(1−u)^(1/2)... ∫u^(1/2)(1−u)^(−1/2) du from 0 to 1: near u→1: (1−u)^(−1/2) integrable ✓. Value: B(3/2, 1/2) = Γ(3/2)Γ(1/2)/Γ(2) = (π/2)/1 = π/2. So (1/2)(π/2) = π/4 ≈ 0.785. Direct 0.5. Pointwise equal at u=1/2, integrals differ → pointwise equality must be wrong elsewhere. Check u=0.75 (x²=3, x=√3): direct integrand·dx: x(1+x²)⁻²·(1+x²)²/(2x) = 1/2 = 0.5 du (independent of u!). Formula (1/2)(u/(1−u))^(1/2) = (1/2)(3)^(1/2) = 0.866 ✗ 0.5. So for s=1 formula gives (1/2)(u/(1−u))^(1/2), direct gives 1/2 for all u?? Direct x(1+x²)⁻²·(1+x²)²/(2x) = 1/2 — yes! So E(1) = ∫₀¹ (1/2) du = 1/2 ✓✓. So formula is wrong: (u/(1−u))^(s/2)(1−u)²(1−u)⁻² = (u/(1−u))^(s/2) → at s=1: (u/(1−u))^(1/2) ✗ should be 1. x^s/(1+x²)² · (1+x²)²/2 · x⁻¹·x... x dx = (1+x²)²/2·... x dx = x·dx = x·(1+x²)²/(2x)·... dx = (1+x²)²/(2x) du → x dx = (1+x²)²/2 du ✓ = (1−u)⁻²/2 du. x^s/(1+x²)² = (u/(1−u))^(s/2)(1−u)². Product: (1/2)(u/(1−u))^(s/2)(1−u)²·(1−u)⁻² = (1/2)(u/(1−u))^(s/2). At s=1: (1/2)(u/(1−u))^(1/2). Direct at x=√3: (1/2)(3)^(1/2) = 0.866. Direct recompute: x = √3: (1+x²) = 4. x/(1+x²)² = √3/16. (1+x²)²/(2x) = 16/(2√3) = 8/√3. Product: (√3/16)(8/√3) = 8/16 = 1/2 ✓. Formula: (1/2)(u/(1−u))^(1/2), u = x²/(1+x²) = 3/4: (1/2)(3)^(1/2) = 0.866 ✗. u/(1−u) = x² ✓ = 3. x^(1/2) = √(x²) = x = √3 ✓. So (1/2)(u/(1−u))^(1/2) = (1/2)√3 ✗ vs 1/2. So x^s/(1+x²)² · x dx ≠ (1/2)(u/(1−u))^(s/2): x^s·(1−u)²·(1−u)⁻²/2 = x^s/2 = (u/(1−u))^(s/2)/2 ✓ algebraically, and x^s at x=√3, s=1 = √3 → (1/2)√3 = 0.866, but direct product is 1/2 → x·(1+x²)²/(2x)·x/(1+x²)² = (1+x²)/(2(1+x²))·... x·(1+x²)²/2 · x/(1+x²)² = x²/2·... = (1+x²)²·x·x/(2(1+x²)²) = x²/2 = 3/2 ✗ 1/2?? Direct: x(1+x²)⁻² · (1+x²)²/(2x) = 1/2 (x cancels!). x·(1+x²)²/(2x) = (1+x²)²/2. So x dx = (1+x²)²/2 du? du/dx = 2x(1+x²)⁻² → dx = (1+x²)²/(2x) du → x dx = (1+x²)²/2·(1/x)·x du = (1+x²)²/2 du ✓ = 16/2 = 8 at x=√3, so x dx = 8 du → integrand·dx = (√3/16)(8) = √3/2 = 0.866 ✓✓ formula ✓ (I earlier "1/2" error: (√3/16)(8/√3) — (1+x²)²/(2x) = 16/(2·√3) = 8/√3 ✓, × (√3/16) = 8/16·(√3/√3) = 1/2·... (√3/16)(8/√3) = 8·√3/(16·√3) = 1/2. But (1+x²)²/2·(x/(1+x²)²)·... integrand x(1+x²)⁻² = √3/16, × dx = ×(8/√3)du = (√3/16)(8/√3) = 0.5·... √3·8/(16√3) = 0.5. Formula x²/2 = 3/2, ×... x dx = (1+x²)²/2 du = 8 du; integrand·(x dx) = (√3/16)(8 du) = (√3/2) du = 0.866 du. But (√3/16)(8/√3): I conflated: dx = (1+x²)²/(2x) du = 16/(2√3) = 8/√3 = 4.619 du. x(1+x²)⁻² = √3/16 = 0.1083. Product = 0.1083·4.619 = 0.5 ✓. Formula (1/2)(u/(1−u))^(s/2) = (1/2)(3)^(1/2) = 0.866. ✗. x²/2: (1+x²)²/2·x/(1+x²)²·(1/x)·x... I'll give up the algebra audit — the numerical values are authoritative: E(1) = 0.5, and the u-formula gives (1/2)(u/(1−u))^(1/2) whose integral is π/4 ≠ 1/2. Since pointwise both are... formula pointwise = integrand·dx = (u/(1−u))^(s/2)/2 (proved: x^s(1+x²)⁻²·(1+x²)²/2 = x^s/2 = (u/(1−u))^(s/2)/2). At x=√3: (3)^(1/2)/2 = 0.866. Integrand·dx directly: (√3/16)·(16/√3) = 1?? (1+x²)²/(2x) = 16/(2√3) = 8/√3. (√3/16)(8/√3) = 0.5. (u/(1−u))^(s/2)/2 = 3^(1/2)/2 = 0.866. So x^s/2 at x=√3, s=1: √3/2 = 0.866, integrand·dx = 0.5 → x^s·(1+x²)⁻²·(1+x²)²/(2x) = x^(s−1)/(2)·(1+x²)⁰·... = x^s/(2x) = x^(s−1)/2 = x⁰/2 = 1/2 ✓ (s=1). So the correct formula is x dx = (1+x²)²/(2x) du = x^(−1)(1+x²)²/2 du and x^s·x⁻¹ = x^(s−1), not x^s. I kept the x^s without dividing. So E(s) = (1/2)∫₀¹ (u/(1−u))^((s−1)/2)(1−u)²(1−u)⁻²·...
+
+E(s) = ∫ x^s(1+x²)⁻² dx = ∫ (u/(1−u))^(s/2)·(1−u)²·(1+x²)⁻²·... dx = (1+x²)⁻²·(1+x²)²/(2x) du = du/(2x) = du/((u/(1−u))^(1/2)·2). E(s) = (1/2)∫ (u/(1−u))^(s/2)(1−u)^(1/2) du = (1/2)∫ u^(s/2)(1−u)^(1/2−s/2) du = (1/2)B(s/2+1, 3/2−s/2). E(1) = (1/2)B(3/2, 1/2) = (1/2)(π/2) = π/4 ✗ 1/2. B(3/2,1/2) = Γ(3/2)Γ(1/2)/Γ(2) = (√π/2)(√π) = π/2 → half → π/4 = 0.785 ✗.
+
+Enough — the Beta route is giving me arithmetic headaches and the numerical integrals have already nailed everything:
+
+Verified numerics:
+
+F(1) = ∫₀∞ 1/(1+x²)² dx = 0.78539816 = π/4 ✓
+F(1)' = ∫₀∞ ln x/(1+x²)² dx = −0.7853981274858949 = −π/4 ✓
+I(0.5) = −10.63835749; formula (π/4a³)(ln a − 1) at a=0.5: (π/4)(8)(ln 0.5 − 1) = 2π(−1.6931472) = −10.6383574878 ✓ (diff ~2.2e-9... computed: (π/4)/0.125·(ln 0.5−1) = 2π(−1.693147) = −10.63835749 ✓)
+I(2) = −0.030125205983853875; formula: (π/4)(1/8)(ln 2 − 1) = (π/32)(−0.30685282) = −0.0301252 ✓ (tool: −0.030125205102693474 ✓)
+I(e) = −2.2231227729e-09 ≈ 0; formula: (π/4)(e⁻³)(ln e − 1) = 0 exactly ✓ (ln e − 1 = 0)
+So I(a) = (π/(4a³))(ln a − 1).
+
+The correct clean derivation (Method A): F(s) = (1/2)B(s/2, 1−s/2)·... the clean known result: ∫₀∞ x^(s−1)/(1+x²)² dx = (π/4)·(s/sin(πs/2))·... test: s=1: (π/4)(1/1) = π/4 ✓. s=2: (π/4)(2/sin π) = ∞ ✗. Known correct: F(s) = (π/4)(s/sin(πs/2)) fails at s=2 but F(2) = 1/2 finite → the formula has removable issues... (π/4)(s/sin(πs/2)) at s=2: pole. But F(2) finite → wrong formula. Correct: F(s) = (1/2)B(s/2, 1−s/2) is the formula for ∫x^(s−1)/(1+x²) (which is π/sin(πs/2)/2·... ∫₀∞ x^(s−1)/(1+x²) dx = (1/2)π/sin(πs/2), pole at s=2 ✓ correct since integrand x/(1+x²) diverges at ∞ ✓). For the squared denominator: F(s) = (1/2)B(s/2, 1−s/2) − (1/2)∫... use (1+x²)⁻² = (1+x²)⁻¹ − x²(1+x²)⁻¹·(1/(1+x²))... (1+x²)⁻² = (1+x²)⁻¹ − x²(1+x²)⁻² (tautological). Non-tautological: (1+x²)⁻² = (1+x²)⁻¹ − (1+x²)⁻¹·x²·(1+x²)⁻¹... = (1+x²)⁻¹ − x²(1+x²)⁻² ✗ circular.
+
+Cleanest: F(s) = (1/2)∫₀∞ t^(s/2−1)(1+t)⁻² dt with t = x², x^s = t^(s/2), dx = dt/(2x) = dt/(2t^(1/2)): F(s) = (1/2)∫₀∞ t^(s/2−1/2)(1+t)⁻²·t⁻¹ dt = (1/2)∫₀∞ t^(s/2−1)(1+t)⁻² dt. Now expand (1+t)⁻² = (1+t)⁻¹(1+t)⁻¹ and use (1+t)⁻² = (1+t)⁻¹ − t(1+t)⁻²... use identity (1+t)⁻² = (1+t)⁻¹·(1+t)⁻¹ and the Beta integral form ∫ t^(p−1)(1+t)⁻^(p+q) dt = B(p, q) = B(p,q) (with p = s/2, p+q = 2 → q = 2−s/2): ∫₀∞ t^(s/2−1)(1+t)⁻² dt = B(s/2, 2−s/2)·... standard: ∫₀∞ t^(p−1)/(1+t)^(p+q) dt = B(p,q). Here (1+t)⁻² → p+q = 2, p = s/2, q = 2−s/2. So F(s) = (1/2)B(s/2, 2−s/2) = (1/2)Γ(s/2)Γ(2−s/2)/Γ(2) = (1/2)Γ(s/2)Γ(2−s/2).
+
+F(1) = (1/2)Γ(1/2)Γ(3/2) = (1/2)(√π)(√π/2) = π/4 ✓✓✓. F(2) = (1/2)Γ(1)Γ(1) = 1/2 ✓✓✓.
+
+Now differentiate: ln F(s) = ln(1/2) + ln Γ(s/2) + ln Γ(2−s/2).
+F'(1) = F(1)·[ (1/2)ψ(1/2) − (1/2)ψ(3/2) ]
+ψ(1/2) = −γ − 2ln 2, ψ(3/2) = ψ(1/2) + 2. So (1/2)(ψ(1/2) − ψ(3/2)) = (1/2)(−2) = −1.
+F'(1) = (π/4)(−1) = −π/4 ✓✓✓ matches numeric −0.7853981274.
+
+Everything consistent. Now assemble:
+
+I(a) = (ln a)/a³·A + B/a³, A = ∫₀∞ dt/(1+t²)² = π/4, B = F'(1) = −π/4.
+
+I(a) = (π/(4a³))(ln a − 1).
+
+Note: the (ln a)/a³ term comes from ∫₀∞ dt/(1+t²)² = π/4 — same A. ✓
+
+Also note that the numerical verification used exactly this reduction chain (quad directly on I(a) for a = 1, 2, 0.5, e all match).
+
+Write the answer up cleanly: substitution, Method A (Mellin/Beta) done correctly with F(s) = (1/2)B(s/2, 2−s/2), differentiate, result, verification table. Mention Method B exists but not needed. Keep it professional, no emojis, no cringing.
+</think>
+
+Closed form of I(a) = ∫₀^∞ ln(x)/(x² + a²)² dx
+Step 1 — Reduction to a = 1 (substitution x = at)
+x = at, dx = a dt:
+
+I(a) = (1/a³)∫₀^∞ [ln a + ln t]/(1 + t²)² dt = (ln a)/a³ · A + B/a³
+
+where A = ∫₀^∞ dt/(1+t²)² and B = ∫₀^∞ ln t/(1+t²)² dt is the a = 1 case.
+
+A: with t = tan θ: ∫₀^(π/2) cos²θ dθ = π/4.
+
+So I(a) = (π ln a − 4B... no: I(a) = (ln a)/a³ · (π/4) + B/a³.
+
+Step 2 — B via Method A (Mellin/Beta)
+Define F(s) = ∫₀^∞ x^(s−1)/(1+x²)² dx (converges for 0 < s < 3), so B = F'(1).
+
+Substitute t = x² (x^(s−1)dx = (1/2)t^(s/2−1)dt... carefully: x^(s−1)dx = (1/2)t^(s/2 − 1/2)·(1/t)·t dt = (1/2)t^(s/2−1)dt):
+
+F(s) = (1/2)∫₀^∞ t^(s/2−1)/(1+t)² dt = (1/2)·B(s/2, 2 − s/2)
+
+using the standard Mellin form ∫₀^∞ t^(p−1)/(1+t)^(p+q) dt = B(p,q) with p = s/2, p+q = 2.
+
+Hence F(s) = (1/2)Γ(s/2)Γ(2−s/2) (since Γ(2) = 1).
+
+Check anchors: F(1) = (1/2)Γ(1/2)Γ(3/2) = (1/2)(√π)(√π/2) = π/4 ✓ (the known ∫₀^∞ dx/(1+x²)²); F(2) = (1/2)Γ(1)Γ(1) = 1/2 ✓ (∫₀^∞ x/(1+x²)² dx).
+
+Differentiate (F'(1) = B):
+ln F(s) = ln(1/2) + ln Γ(s/2) + ln Γ(2−s/2)
+d/ds = (1/2)ψ(s/2) − (1/2)ψ(2−s/2)
+
+At s = 1: ψ(1/2) = −γ − 2ln2, ψ(3/2) = ψ(1/2) + 2 ⇒ (1/2)[ψ(1/2) − ψ(3/2)] = −1.
+
+B = F'(1) = F(1)·(−1) = −π/4.
+
+Result
+I(a) = (π ln a)/(4a³) − (π/4)·1/a³ =
+
+I(a) = (π/(4a³))·(ln a − 1)
+
+Verification (numeric integration vs formula)
+a
+Numeric ∫₀^∞ ln x/(x²+a²)² dx
+(π/(4a³))(ln a − 1)
+1
+−0.7853981274858949
+−π/4 = −0.7853981633974483
+2
+−0.030125205983853875
+−0.030125205102693474
+0.5
+−10.638357490007945
+−10.638357487786791
+e
+−2.223×10⁻⁹
+exactly 0 (ln e − 1 = 0)
+
+
+All agree to within quadrature error. Note the e case: I(e) = 0 exactly, since ln(e·x)/e³ is antisymmetric under x → e/x... equivalently the integrand's log-mean cancels — a good consistency check that the (ln a − 1) coefficient is right, not just (ln a).
+
+So for all a > 0:
+
+I(a) = (π/(4a³))(ln a − 1)
