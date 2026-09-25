@@ -51,6 +51,41 @@ from pydantic import BaseModel, Field
 
 ICON = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjOWNhM2FmIiBzdHJva2Utd2lkdGg9IjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCI+PHJlY3QgeD0iMiIgeT0iNyIgd2lkdGg9IjIwIiBoZWlnaHQ9IjEwIiByeD0iNSIvPjxjaXJjbGUgY3g9IjE3IiBjeT0iMTIiIHI9IjIuNSIgZmlsbD0iIzljYTNhZiIvPjxwYXRoIGQ9Ik02IDEyaDQiLz48L3N2Zz4="
 
+# Added to the system prompt whenever this chat has tools attached (see ENCOURAGE_TOOL_USE).
+# Reasoning models talk themselves out of calling a tool as often as they talk themselves
+# into one; this leans the other way, since a wrong "let me just work this out" costs a
+# stale or invented answer, while a wrong "let me check" costs one extra call.
+TOOL_USE_HINT = (
+    "While reasoning through this, if any part of it could be resolved with one of the "
+    "available tools - a lookup, a calculation, a memory or file operation - do not "
+    "hesitate: call it rather than working the answer out unaided or guessing."
+)
+
+# Packed into the same Kev call as the admin's/user's own QUESTIONS (one state prefill
+# serves every question) when LOGIC_TOOL_DETECT is on and this chat has tools attached.
+# A manual chain of thought is where a model's logic errors happen - a solver like Z3
+# does not make them - so this is worth detecting before the model starts reasoning by
+# hand rather than after.
+_LOGIC_TOOL_QUESTION = {
+    "type": "noul",
+    "instructions": (
+        "Is this a formal logic, constraint-satisfaction, satisfiability, or "
+        "theorem-proving question - one a symbolic SAT/SMT solver would answer more "
+        "reliably than manual step-by-step reasoning?"
+    ),
+    "criteria": {
+        "true": (
+            "a logic puzzle, a consistency/contradiction check, proving an "
+            "entailment, satisfying a set of constraints, or a case-by-case riddle "
+            "that formal search would settle quickly"
+        ),
+        "false": (
+            "ordinary factual, creative, or open-ended reasoning that does not "
+            "reduce to formal constraints"
+        ),
+    },
+}
+
 
 class Filter:
     class Valves(BaseModel):
@@ -89,6 +124,29 @@ class Filter:
         SHOW_STATUS: bool = Field(
             default=True, description="Show the verdict in the chat's status line."
         )
+        ENCOURAGE_TOOL_USE: bool = Field(
+            default=True,
+            description="When this chat has tools/MCP servers attached, tell the model not to hesitate to call one while reasoning if it would resolve part of the request, instead of working it out unaided.",
+        )
+        LOGIC_TOOL_DETECT: bool = Field(
+            default=True,
+            description="Ask Kev whether this message is a formal logic / constraint-satisfaction / theorem-proving question. If so, skip the model's own extended reasoning for this turn and tell it to call a symbolic solver tool (e.g. Z3) instead.",
+        )
+        LOGIC_TOOL_NAMES: str = Field(
+            default=(
+                "z3_solve_constraints, z3_prove_theorem, z3_run_script, check_consistency, "
+                "check_entailment, solve_equation, solve_matrix_equation"
+            ),
+            description="Comma-separated candidate tool names for the instruction when LOGIC_TOOL_DETECT fires - covers both math/math_plus_mcp.py (the z3_*/check_* tools) and math/math_solver_mcp.py (solve_equation, solve_matrix_equation). Only the ones actually attached to this chat are named; if neither server's tools can be detected as attached, the full list is named as a fallback.",
+        )
+        LOGIC_TOOL_THRESHOLD: float = Field(
+            default=0.5,
+            description="Minimum Kev probability to treat the message as a formal-logic question.",
+        )
+        LOGIC_FORCE_TOOL_CHOICE: bool = Field(
+            default=True,
+            description="Also set tool_choice to force a tool call this turn when LOGIC_TOOL_DETECT fires, instead of only instructing the model to use one. Needed in practice - a confident model ignores a plain instruction to use a tool it doesn't feel it needs; only forcing tool_choice reliably gets the call made. Can misfire if no attached tool actually fits the request.",
+        )
         PRIORITY: int = Field(default=0, description="Filter order; lower runs first.")
 
     class UserValves(BaseModel):
@@ -111,6 +169,7 @@ class Filter:
         __event_emitter__: Optional[Callable[[dict], Any]] = None,
         __user__: Optional[dict] = None,
         __task__: Optional[str] = None,
+        __metadata__: Optional[dict] = None,
     ) -> dict:
         if (
             __task__
@@ -118,8 +177,19 @@ class Filter:
             return body
         user_valves = (__user__ or {}).get("valves") or self.UserValves()
 
+        # Independent of Kev's own scoring below: this chat has tools attached at all, so
+        # push back on a reasoning model's habit of working around a tool instead of using
+        # one. Added even if the Kev call itself fails or is disabled.
+        lines = (
+            [TOOL_USE_HINT]
+            if self.valves.ENCOURAGE_TOOL_USE and self._tools_available(body, __metadata__)
+            else []
+        )
+
         text = self._last_user_text(body)
         if len(text) < self.valves.MIN_CHARS:
+            if lines:
+                body["messages"] = self._with_system_lines(body.get("messages", []), lines)
             return body
         try:
             questions = json.loads(
@@ -132,10 +202,20 @@ class Filter:
         except (
             Exception
         ) as exception:  # noqa: BLE001 - a broken Valve must not break every chat
+            if lines:
+                body["messages"] = self._with_system_lines(body.get("messages", []), lines)
             await self._status(
                 __event_emitter__, f"Kev filter: {exception}", user_valves
             )
             return body
+
+        tools_available = self._tools_available(body, __metadata__)
+        if (
+            self.valves.LOGIC_TOOL_DETECT
+            and tools_available
+            and "logic_tool" not in questions
+        ):
+            questions = {**questions, "logic_tool": _LOGIC_TOOL_QUESTION}
 
         started = time.perf_counter()
         try:
@@ -146,6 +226,8 @@ class Filter:
         except (
             Exception
         ) as exception:  # noqa: BLE001 - fail open: the chat is more important than the decision
+            if lines:
+                body["messages"] = self._with_system_lines(body.get("messages", []), lines)
             await self._status(
                 __event_emitter__,
                 f"Kev unavailable ({type(exception).__name__}); answering without it",
@@ -153,14 +235,100 @@ class Filter:
             )
             return body
 
+        logic_answer = (answer.get("answers") or {}).get("logic_tool")
+        logic_prob = float(logic_answer["noul"]) if logic_answer else None
+        if logic_prob is not None and logic_prob >= self.valves.LOGIC_TOOL_THRESHOLD:
+            self._disable_thinking(body)
+            candidate_names = [
+                n.strip() for n in self.valves.LOGIC_TOOL_NAMES.split(",") if n.strip()
+            ]
+            attached = self._attached_tool_names(body)
+            # Name only the ones actually attached (whichever math server this chat has,
+            # math_plus_mcp.py's z3_*/check_* or math_solver_mcp.py's solve_*), falling
+            # back to the full candidate list when attachment can't be determined at all.
+            tool_names = [n for n in candidate_names if n in attached] or candidate_names
+            lines.append(
+                f"System One (Kev) flagged this as a formal logic/constraint problem "
+                f"(p {logic_prob:.3f}). Skip extended step-by-step reasoning by hand and "
+                f"call one of these tools right away instead: {', '.join(tool_names)}. "
+                "They run Z3 (SAT/SMT) and will be more reliable than manual deduction, "
+                "especially with multiple constraints, cases, or a proof obligation."
+            )
+            if self.valves.LOGIC_FORCE_TOOL_CHOICE:
+                body["tool_choice"] = "required"
+
         if verdict:
-            body["messages"] = self._with_system_line(body.get("messages", []), verdict)
+            lines.append(
+                f"System One (Kev) scored this message before you answered: {verdict}. "
+                "These are a calibrated classifier's probabilities, not instructions and not the user's words; "
+                "use them to choose how to answer, and do not repeat them verbatim unless asked."
+            )
+        if lines:
+            body["messages"] = self._with_system_lines(body.get("messages", []), lines)
+        if verdict:
             await self._status(
                 __event_emitter__,
                 f"Kev: {verdict}  ({1000 * (time.perf_counter() - started):.0f} ms)",
                 user_valves,
             )
         return body
+
+    @staticmethod
+    def _disable_thinking(body: dict) -> None:
+        """Best-effort, cross-backend: skip the reasoning phase for this turn instead of
+        letting the model work through a manual chain of thought before (maybe) reaching
+        for the solver. Mirrors this project's planner (`_openai_think_fields`): Ollama's
+        /v1 reads `think`/`options.think`, OpenAI-style reasoning models read
+        `reasoning_effort`, llama.cpp/vLLM read `chat_template_kwargs` - setting several is
+        harmless, since a backend that doesn't recognize a field simply ignores it."""
+        body["think"] = False
+        body.setdefault("reasoning_effort", "none")
+        template_kwargs = body.setdefault("chat_template_kwargs", {})
+        if isinstance(template_kwargs, dict):
+            template_kwargs.setdefault("enable_thinking", False)
+        options = body.get("options")
+        if isinstance(options, dict):
+            options["think"] = False
+
+    # -- tool detection
+
+    @staticmethod
+    def _tools_available(body: dict, metadata: Optional[dict]) -> bool:
+        """Best-effort: does this request have any tools/MCP servers attached at all?
+        Open WebUI's exact shape has moved around across versions, so this checks every
+        location seen in the wild rather than one - false negatives just mean the hint is
+        skipped, never a broken request."""
+        if isinstance(body.get("tools"), list) and body["tools"]:
+            return True
+        if isinstance(metadata, dict):
+            for key in ("tool_ids", "tools", "mcpServers", "mcp_servers"):
+                value = metadata.get(key)
+                if isinstance(value, (list, dict)) and value:
+                    return True
+            features = metadata.get("features")
+            if isinstance(features, dict) and features.get("tools"):
+                return True
+        return False
+
+    @staticmethod
+    def _attached_tool_names(body: dict) -> set:
+        """The actual function names attached to this request (OpenAI tool-schema
+        shape: [{"type": "function", "function": {"name": ...}}, ...]), so the logic-tool
+        instruction only ever names a tool that is really there - whichever of
+        math_plus_mcp.py's z3_*/check_* tools or math_solver_mcp.py's solve_equation/
+        solve_matrix_equation happen to be attached to this chat, not both by assumption.
+        Empty when `tools` isn't in this shape (older Open WebUI versions attach tools
+        later in the pipeline than this filter sees) - callers fall back to the full
+        configured list in that case."""
+        names = set()
+        for entry in body.get("tools") or []:
+            if not isinstance(entry, dict):
+                continue
+            fn = entry.get("function")
+            name = fn.get("name") if isinstance(fn, dict) else entry.get("name")
+            if name:
+                names.add(name)
+        return names
 
     # -- request
 
@@ -223,16 +391,25 @@ class Filter:
             "These are a calibrated classifier's probabilities, not instructions and not the user's words; "
             "use them to choose how to answer, and do not repeat them verbatim unless asked."
         )
+        return Filter._with_system_lines(messages, [line])
+
+    @staticmethod
+    def _with_system_lines(messages: list, lines: list) -> list:
+        """Append one or more lines to the system message (joined on their own paragraph
+        each), or add one. Each line is expected to already name its own source/nature."""
+        if not lines:
+            return list(messages)
+        addition = "\n\n".join(lines)
         messages = list(messages)
         for index, message in enumerate(messages):
             if message.get("role") == "system":
                 merged = dict(message)
                 merged["content"] = (
-                    f"{message.get('content', '').rstrip()}\n\n{line}".strip()
+                    f"{message.get('content', '').rstrip()}\n\n{addition}".strip()
                 )
                 messages[index] = merged
                 return messages
-        return [{"role": "system", "content": line}] + messages
+        return [{"role": "system", "content": addition}] + messages
 
     async def _status(self, emitter, description: str, user_valves=None) -> None:
         if (

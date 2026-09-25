@@ -1385,6 +1385,7 @@ class StandalonePlanner:
             True,
             self._phase_params("planning"),
         )
+        raw = await self._emit_thought("planning", raw)
         parsed = _extract_json_object(raw)
         tasks: list[Task] = []
         if parsed and isinstance(parsed.get("tasks"), list):
@@ -1683,6 +1684,7 @@ class StandalonePlanner:
             False,
             self._phase_params("synthesis"),
         )
+        draft = await self._emit_thought("synthesis", draft)
         final = self._resolve_macros(draft, tasks)
 
         # Normalize abbreviations
@@ -1710,6 +1712,7 @@ class StandalonePlanner:
                 False,
                 self._phase_params("synthesis"),
             )
+            final = await self._emit_thought("review", final)
             # Normalize again after review
             final = self._normalize_abbreviations(final)
 
@@ -2030,7 +2033,19 @@ class StandalonePlanner:
         tools_possible = bool(self.config.mcp_servers) and self.chat is not None
         await self._profile_request(goal, tools_available=tools_possible)
 
-        if self._mcp_worth_connecting(goal, tools_possible):
+        # A full multi-task plan is exactly the case the goal-text heuristic (and Kev's
+        # own top-level "does this need a tool" read of that same text) is least trusted
+        # for: a subtask the planner decomposes into may need a tool nothing about the
+        # original wording suggested. Decomposing a plan already justifies the connection
+        # cost, so skip the gate there and always connect while any tools exist at all -
+        # the gate stays for the single-pass fast path, where being wrong is cheap.
+        will_plan = self.config.plan_mode and not await self._should_skip_planning(goal)
+        if will_plan:
+            worth_connecting = tools_possible
+        else:
+            worth_connecting = self._mcp_worth_connecting(goal, tools_possible)
+
+        if worth_connecting:
             mcp_cm = self._make_mcp()
             skipped_by_heuristic = False
         else:
@@ -2998,7 +3013,11 @@ class Pipe:
         __metadata__: Optional[dict] = None,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
         **kwargs: Any,
-    ) -> str:
+    ):
+        # An async generator, not a plain `-> str`: Open WebUI streams each yielded chunk
+        # as it arrives instead of waiting for one final return, which is what lets a
+        # phase's thinking reach the visible message as soon as it happens (see `chunks`
+        # below) rather than only once the whole run has finished.
         # Lazy OWUI imports so this module also loads outside Open WebUI (CLI).
         from open_webui.utils.chat import generate_chat_completion
         from open_webui.models.users import Users
@@ -3006,14 +3025,16 @@ class Pipe:
         valves = self.valves
         model_id = self._resolve_model(__request__, body)
         if not model_id:
-            return (
+            yield (
                 "⚠️ Planner could not find a model to drive. Set the **PLANNER_MODEL** "
                 "valve to a real model id (e.g. `gpt-4o`)."
             )
+            return
 
         goal = self._extract_goal(body)
         if not goal:
-            return "⚠️ No user message found to plan from."
+            yield "⚠️ No user message found to plan from."
+            return
 
         user = None
         if __user__ and __user__.get("id"):
@@ -3044,15 +3065,17 @@ class Pipe:
         # Status events are transient: Open WebUI's status widget only ever shows the
         # latest one and doesn't persist them on the message, so a "thinking" line is
         # overwritten by the next status (often within the same tick) before anyone can
-        # read it, and it's gone entirely once the response finishes. Collect thought
-        # lines separately so they can be embedded in the final message as a `<think>`
-        # block - which Open WebUI renders as a persistent, expandable section - instead
-        # of relying on the fleeting status trace to carry them.
-        collected_thoughts: list[str] = []
+        # read it, and it's gone entirely once the response finishes. A thought is instead
+        # pushed onto this queue as soon as it happens, and the generator loop at the
+        # bottom of this method yields it right away as its own `<think>` block - so
+        # reasoning appears live, phase by phase, instead of only once the whole run (plan
+        # + every task + synthesis) has finished.
+        chunks: asyncio.Queue = asyncio.Queue()
 
         async def progress(message: str) -> None:
             if "\U0001f4ad" in message and " thinking:\n" in message:
-                collected_thoughts.append(message.split("\U0001f4ad ", 1)[1])
+                thought = message.split("\U0001f4ad ", 1)[1]
+                await chunks.put(("chunk", f"<think>\n{thought}\n</think>\n\n"))
             if __event_emitter__ and valves.EMIT_STATUS:
                 await __event_emitter__(
                     {
@@ -3314,32 +3337,51 @@ class Pipe:
         if not chat_id:
             chat_id = body.get("chat_id")
 
-        try:
-            result = await planner.run(goal, chat_id=chat_id)
-        except Exception as exc:
-            if __event_emitter__ and valves.EMIT_STATUS:
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {"description": f"Error: {exc}", "done": True},
-                    }
-                )
-            return f"❌ Planner error: {exc}"
+        # planner.run() drives `progress()` from its own task, pushing each thought onto
+        # `chunks` as it happens; this loop yields them the moment they arrive, so the
+        # visible message grows live instead of appearing all at once at the end.
+        async def run_planner() -> None:
+            try:
+                result = await planner.run(goal, chat_id=chat_id)
+            except Exception as exc:  # noqa: BLE001 - surfaced to the chat, not raised
+                await chunks.put(("error", exc))
+                return
+            await chunks.put(("done", result))
 
-        if __event_emitter__ and valves.EMIT_STATUS:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"Done ({len(result.tasks)} task(s), {result.elapsed_seconds:.1f}s)",
-                        "done": True,
-                    },
-                }
-            )
-        if collected_thoughts:
-            think_block = "\n\n".join(collected_thoughts)
-            return f"<think>\n{think_block}\n</think>\n\n{result.final_output}"
-        return result.final_output
+        task = asyncio.ensure_future(run_planner())
+        try:
+            while True:
+                kind, payload = await chunks.get()
+                if kind == "chunk":
+                    yield payload
+                    continue
+                if kind == "error":
+                    if __event_emitter__ and valves.EMIT_STATUS:
+                        await __event_emitter__(
+                            {
+                                "type": "status",
+                                "data": {"description": f"Error: {payload}", "done": True},
+                            }
+                        )
+                    yield f"❌ Planner error: {payload}"
+                    return
+                # "done"
+                result = payload
+                if __event_emitter__ and valves.EMIT_STATUS:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": f"Done ({len(result.tasks)} task(s), {result.elapsed_seconds:.1f}s)",
+                                "done": True,
+                            },
+                        }
+                    )
+                yield result.final_output
+                return
+        finally:
+            if not task.done():
+                task.cancel()
 
 
 # ---------------------------------------------------------------------------

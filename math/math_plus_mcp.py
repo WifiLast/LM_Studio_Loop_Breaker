@@ -710,6 +710,115 @@ def _safe_eval_numeric(expression: str, variables: Dict[str, object] | None = No
     return True, value, "value_computed", "Expression evaluated successfully."
 
 
+def _free_symbol_names(expression: str) -> list[str]:
+    """Identifiers in `expression` that `_safe_eval_numeric`'s namespace does not already
+    provide (not a numpy name/constant, not a keyword) - the candidates for treating an
+    equation as an identity over free variables instead of a fixed numeric claim."""
+    names = set(re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", expression))
+    return sorted(
+        name for name in names if name not in _SAFE_GLOBALS and not keyword.iskeyword(name)
+    )
+
+
+def _denominator_variable_names(expression: str) -> set[str]:
+    """Free variable names in `expression` that appear as a division denominator
+    anywhere in it (e.g. `n` in `1/n` or `(n - 2)/n`), so a symbolic identity check can
+    exclude the trivial "denominator equals zero" singularity - the original expression
+    is undefined there anyway, so a counterexample at that point disproves nothing."""
+    if not hasattr(ast, "unparse"):
+        return set()  # Python < 3.9: skip the refinement, never a wrong answer, just a
+                       # looser one (guard_vars is only ever additive precision)
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            try:
+                names.update(_free_symbol_names(ast.unparse(node.right)))
+            except Exception:
+                continue
+    return names
+
+
+def _check_equation_as_identity(lhs: str, rhs: str) -> Optional[Dict[str, object]]:
+    """Fallback for `check_equation` when numeric evaluation fails because lhs/rhs name a
+    variable instead of a number (e.g. `1/n + (n-2)/n * (1/2)` vs `1/2`): rather than just
+    erroring, treat every undefined name as a free real variable and ask Z3 whether the
+    equation is an identity - `Not(lhs == rhs)` unsat means it holds for every value.
+
+    Returns None when this doesn't apply (no undefined names to explain the failure, a
+    numpy function was used - Z3 has no np.cos/np.sin/... equivalent, so the expression
+    can't be handed to it symbolically - or Z3 can't decide), so the caller falls back to
+    the original numeric error untouched.
+    """
+    if "np." in lhs or "np." in rhs:
+        return None
+
+    names = sorted(set(_free_symbol_names(lhs)) | set(_free_symbol_names(rhs)))
+    if not names:
+        return None
+
+    variables = {name: _z3.Real(name) for name in names}
+    try:
+        lhs_expr = eval(
+            compile(_normalize_unit_literals(lhs), "<expression>", "eval"),
+            {"__builtins__": {}},
+            dict(variables),
+        )
+        rhs_expr = eval(
+            compile(_normalize_unit_literals(rhs), "<expression>", "eval"),
+            {"__builtins__": {}},
+            dict(variables),
+        )
+    except Exception:
+        return None
+
+    # Exclude the trivial "denominator is zero" singularity: the original expression is
+    # undefined there, so a counterexample at that point disproves nothing about the
+    # identity over its actual domain.
+    guarded = sorted(_denominator_variable_names(lhs) | _denominator_variable_names(rhs))
+    solver = _z3.Solver()
+    for name in guarded:
+        if name in variables:
+            solver.add(variables[name] != 0)
+    solver.add(_z3.Not(lhs_expr == rhs_expr))
+    result = solver.check()
+    domain_note = f" (excluding {', '.join(guarded)} = 0, where it is undefined)" if guarded else ""
+    if result == _z3.unsat:
+        return _verdict(
+            True,
+            status="identity",
+            reason=(
+                f"Treated {', '.join(names)} as free real variable(s) since they were not "
+                f"numbers: the equation holds for every value{domain_note} "
+                "(Z3 found no counterexample)."
+            ),
+            value={"free_variables": names, "excluded_from_domain": guarded},
+        )
+    if result == _z3.sat:
+        model = solver.model()
+        counterexample = {
+            name: _coerce_model_value(model.eval(var, model_completion=True))
+            for name, var in variables.items()
+        }
+        return _verdict(
+            True,
+            status="not_identity",
+            reason=(
+                f"Treated {', '.join(names)} as free real variable(s) since they were not "
+                f"numbers: the equation does not hold for every value{domain_note}."
+            ),
+            value={
+                "free_variables": names,
+                "excluded_from_domain": guarded,
+                "counterexample": counterexample,
+            },
+        )
+    return None  # Z3 returned "unknown": fall back to the original numeric error
+
+
 def _z3_type_from_name(type_name: str | None) -> object:
     normalized = (type_name or "Real").strip().lower()
     if normalized == "bool":
@@ -809,11 +918,17 @@ def check_equation(lhs: str, rhs: str, tol: float = 1e-9) -> Dict[str, object]:
     """Check whether two expressions are equal within tolerance.
 
     Supported grammar: arithmetic `+`, `-`, `*`, `/`, parentheses, and simple unit
-    literals such as `5 V` and `5000 mV`.
+    literals such as `5 V` and `5000 mV`. If either side names a variable instead of a
+    number (e.g. `1/n + (n-2)/n * (1/2)` vs `1/2`), it's treated as a free real variable
+    and checked as an identity with Z3 instead of failing outright.
     """
 
     lhs_ok, lhs_value, lhs_status, lhs_reason = _safe_eval_numeric(lhs)
     rhs_ok, rhs_value, rhs_status, rhs_reason = _safe_eval_numeric(rhs)
+    if not lhs_ok or not rhs_ok:
+        symbolic = _check_equation_as_identity(lhs, rhs)
+        if symbolic is not None:
+            return symbolic
     if not lhs_ok:
         return _verdict(False, status=lhs_status, reason=lhs_reason, suggestion="Check the left-hand side expression.")
     if not rhs_ok:

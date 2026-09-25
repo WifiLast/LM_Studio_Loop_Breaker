@@ -1,7 +1,7 @@
 ---
 name: z3-logic-puzzles
 description: >
-  Use this skill whenever the user gives a logic puzzle, riddle, brain teaser, or
+  Use this skill whenever the user gives a logic question or logic puzzle, riddle, brain teaser, or
   "who is lying" / "who owns what" style problem (e.g. mislabeled boxes, knights and
   knaves, zebra puzzles, river crossing, seating arrangements, truth-teller puzzles).
   Instead of reasoning about the puzzle in free text, use the z3 tools in
@@ -87,17 +87,26 @@ general recipe:
 Use when the question is "does X follow from the clues?" — i.e. is there NO
 counterexample.
 
+**Important:** `check_entailment`/`check_consistency`/`z3_solve_constraints` only
+support `Real`/`Int`/`Bool` variables — there is no string/enum sort in this DSL, so
+`some_var == 'oranges'` will fail or behave unpredictably. Encode a named category as a
+distinct integer (or one `Bool` per category) instead:
+
 ```
 check_entailment(
-  premises=["label_apples_box == 'oranges'",
-            "label_oranges_box == 'apples'",
-            "label_mixed_box == 'apples' or label_mixed_box == 'oranges'"],
-  claim="..."
+  premises=["label_apples == 1", "label_oranges == 0",
+            "label_mixed == 0 or label_mixed == 1"],
+  claim="label_mixed != 2"
 )
 ```
-In practice, for anything beyond simple arithmetic/boolean claims (custom categories,
-permutations of roles), prefer `z3_run_script` — build the model, add
-`solver.add(Not(claim))`, and check: `unsat` means the claim is proved.
+(here `0 = Oranges, 1 = Apples, 2 = Mixed` is a convention you pick and use
+consistently across every premise and the claim.)
+
+For anything beyond simple arithmetic/boolean claims — genuinely categorical puzzles
+with several named roles, or permutations of roles — prefer `z3_run_script` instead:
+either build a real model with `solver.add(Not(claim))` (`unsat` proves the claim), or,
+for a puzzle better solved by brute-force enumeration than symbolic search, follow the
+worked example below.
 
 ---
 
@@ -123,26 +132,24 @@ reveals which. Verify this is the *only* box for which one draw always resolves
 everything, by brute-forcing every valid true-content permutation and checking how
 many fruit-types are consistent with the observation for each candidate draw-box:
 
+**Whatever you compute in Python, the answer only reaches you through `solver`'s model
+- `z3_run_script` returns `solver.check()`'s status plus `solver.model()`'s declared
+variables, and NOTHING else. A `print(...)` call inside the script is invisible to
+you: it writes to the server's own console, not to the tool's response. So the last
+step must ASSERT every value you want back as a real Z3 declaration, never print it.**
+
 ```python
 z3_run_script([
     "import itertools",  # already preloaded, shown for clarity
     "labels = ['Apples', 'Oranges', 'Mixed']",
     "contents = ['Apples', 'Oranges', 'Mixed']",
-    "valid_worlds = []",
-    "for perm in itertools.permutations(contents):",
-    "    # perm[i] = true content of the box labeled labels[i]",
-    "    if all(perm[i] != labels[i] for i in range(3)):",
-    "        valid_worlds.append(perm)",
+    "valid_worlds = [perm for perm in itertools.permutations(contents)",
+    "                if all(perm[i] != labels[i] for i in range(3))]",
     "",
     "# For each box we could draw from, check: does the fruit we see always",
     "# uniquely determine which permutation is the true world?",
-    "results = {}",
-    "for draw_index in range(3):",
-    "    ok = True",
-    "    for fruit_seen in ['Apples', 'Oranges']:",
-    "        matches = [w for w in valid_worlds if",
-    "                   (fruit_seen == 'Apples' and w[draw_index] in ('Apples', 'Mixed') and w[draw_index] != 'Oranges') or",
-    "                   (fruit_seen == 'Oranges' and w[draw_index] in ('Oranges', 'Mixed') and w[draw_index] != 'Apples')]",
+    "def resolves(draw_index):",
+    "    for fruit_seen in ('Apples', 'Oranges'):",
     "        # A single fruit drawn from a box whose true content is 'Mixed' could be",
     "        # either type, but since content is fixed, model: Apples-box only yields",
     "        # apples, Oranges-box only yields oranges, Mixed-box yields either -",
@@ -152,20 +159,31 @@ z3_run_script([
     "                      (w[draw_index] == 'Oranges' and fruit_seen == 'Oranges') or",
     "                      (w[draw_index] == 'Mixed')]",
     "        if len(consistent) != 1:",
-    "            ok = False",
-    "    results[labels[draw_index]] = ok",
+    "            return False",
+    "    return True",
     "",
+    "resolving_indexes = [i for i in range(3) if resolves(i)]",
+    "",
+    "# Report the answer through real Z3 declarations, not print(): the caller only",
+    "# ever sees solver.model(), so this is the one and only way the result gets back.",
     "solver = Solver()",
-    "best = [k for k, v in results.items() if v]",
-    "solver.add(Bool('placeholder') == Bool('placeholder'))",  # keeps a trivial sat model
-    "print('valid_worlds:', valid_worlds)",
-    "print('box_that_always_resolves:', best)",
+    "draw_index = Int('draw_index')",
+    "resolving_count = Int('resolving_count')",  # sanity check: should be exactly 1
+    "valid_world_count = Int('valid_world_count')",
+    "solver.add(draw_index == resolving_indexes[0])",
+    "solver.add(resolving_count == len(resolving_indexes))",
+    "solver.add(valid_world_count == len(valid_worlds))",
 ])
 ```
 
-Reading the result: `best` should come back as `['Mixed']` — confirming you must draw
-from the box labeled **"Mixed"**. Then reason forward in plain English using the
-`valid_worlds` printed:
+Reading the result: the returned `model` should come back as
+`{"draw_index": "2", "resolving_count": "1", "valid_world_count": "2"}` (index 2 =
+`labels[2]` = `"Mixed"`) — confirming there are exactly 2 valid worlds, exactly 1 box
+resolves everything with a single draw, and it is the box **labeled "Mixed"**. If
+`resolving_count` ever comes back other than 1, something about the encoding is wrong
+- re-check it rather than trusting the `draw_index` value.
+
+Then reason forward in plain English:
 
 - Draw a fruit from the box **labeled "Mixed"**.
   - If you draw an **apple**, that box is actually **all-Apples** (it can't be Mixed,
