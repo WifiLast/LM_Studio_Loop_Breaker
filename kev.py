@@ -42,8 +42,11 @@ description: A switch in the message box. On, every turn is scored by Kev (Syste
 # the models you want the switch to appear on (or globally). Set KEV_URL in its
 # valves. Each user can change what is asked in their own valves.
 
+import asyncio
 import json
+import re
 import time
+from collections import OrderedDict
 from typing import Any, Callable, Optional
 
 import aiohttp
@@ -85,6 +88,160 @@ _LOGIC_TOOL_QUESTION = {
         ),
     },
 }
+
+# Packed into the same Kev call as everything else above when PLAN_DETECT is on and no
+# plan exists yet for this chat (see Filter._get_plan). Only asked once per chat: once a
+# plan exists it is injected every turn without asking again, until PLAN_TTL passes.
+_NEEDS_PLAN_QUESTION = {
+    "type": "noul",
+    "instructions": (
+        "Is this a multi-part or complex request that would benefit from being broken "
+        "into an explicit plan or checklist of steps, rather than answered directly in "
+        "one response?"
+    ),
+    "criteria": {
+        "true": (
+            "a multi-step task, a project, or something with several deliverables or "
+            "phases that later turns in this chat will keep building on"
+        ),
+        "false": "a simple question or single request answerable directly",
+    },
+}
+
+# The structured-output schema for plan generation (LM Studio / OpenAI json_schema mode),
+# trimmed to just what's injected as guidance: a short ordered checklist, no dependency
+# graph or tool selection - this is a hint for the chat model answering turn by turn, not
+# a plan something else executes (contrast planning_standalone.py's fuller Task schema).
+_PLAN_JSON_SCHEMA: dict = {
+    "name": "plan",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["task_id", "description"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["tasks"],
+        "additionalProperties": False,
+    },
+}
+
+# chat_id -> (created_at, tasks). LRU-evicted (PLAN_MAX_CHATS) and TTL-expired
+# (PLAN_TTL), same pattern as the Kev answer cache below.
+_CHAT_PLAN_STORE: "OrderedDict[str, tuple]" = OrderedDict()
+
+
+def _strip_think_blocks(text: str) -> str:
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"^.*?<think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    return text
+
+
+def _strip_code_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _balanced_object_at(text: str, start: int) -> Optional[str]:
+    depth = 0
+    in_str = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _extract_json_object(text: str) -> Optional[dict]:
+    """Best-effort JSON-object recovery from a completion, the same strategy
+    planning_standalone.py/planning_lite.py use: strip thinking/code fences, try a
+    direct parse, then a brace-balanced scan preferring an object with `tasks`."""
+    cleaned = _strip_code_fences(_strip_think_blocks(text))
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    fallback: Optional[dict] = None
+    for m in re.finditer(r"\{", cleaned):
+        candidate = _balanced_object_at(cleaned, m.start())
+        if not candidate:
+            continue
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "tasks" in obj:
+            return obj
+        if fallback is None and isinstance(obj, dict):
+            fallback = obj
+    return fallback
+
+
+def _content_from_choices(data: dict) -> str:
+    if not isinstance(data, dict):
+        return ""
+    choices = data.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        message = choices[0].get("message") or {}
+        if isinstance(message, dict):
+            content = message.get("content")
+            if content:
+                return content
+            if message.get("reasoning_content"):
+                return message["reasoning_content"]
+        if choices[0].get("text"):
+            return choices[0]["text"]
+    if data.get("content"):
+        return data["content"]
+    return ""
+
+
+def _owui_extract_content(response: Any) -> str:
+    """Pull assistant text out of an Open WebUI chat completion response, whichever
+    shape it comes back as (dict, plain string, or a FastAPI Response with `.body`)."""
+    if isinstance(response, dict):
+        return _content_from_choices(response)
+    if isinstance(response, str):
+        return response
+    body = getattr(response, "body", None)
+    if body:
+        try:
+            return _content_from_choices(json.loads(body))
+        except Exception:
+            try:
+                return (
+                    body.decode() if isinstance(body, (bytes, bytearray)) else str(body)
+                )
+            except Exception:
+                return ""
+    return ""
 
 
 class Filter:
@@ -147,6 +304,28 @@ class Filter:
             default=True,
             description="Also set tool_choice to force a tool call this turn when LOGIC_TOOL_DETECT fires, instead of only instructing the model to use one. Needed in practice - a confident model ignores a plain instruction to use a tool it doesn't feel it needs; only forcing tool_choice reliably gets the call made. Can misfire if no attached tool actually fits the request.",
         )
+        PLAN_DETECT: bool = Field(
+            default=True,
+            description="Ask Kev whether a request is complex/multi-step; if so and no plan exists yet for this chat, generate one (a short checklist, via one completion call to the same chat model) and inject it as guidance every turn thereafter.",
+        )
+        PLAN_THRESHOLD: float = Field(
+            default=0.5,
+            description="Minimum Kev probability to treat the request as needing a plan.",
+        )
+        PLAN_MAX_TASKS: int = Field(
+            default=8, description="Max steps in a generated plan."
+        )
+        PLAN_TEMPERATURE: float = Field(
+            default=0.3,
+            description="Sampling temperature for plan generation. Kept low for a deterministic, parseable checklist.",
+        )
+        PLAN_TTL: float = Field(
+            default=3600.0,
+            description="Seconds a chat's plan stays cached with no new message before it's dropped (a later message then re-triggers detection).",
+        )
+        PLAN_MAX_CHATS: int = Field(
+            default=200, description="Max chats to remember a plan for at once (LRU-evicted)."
+        )
         PRIORITY: int = Field(default=0, description="Filter order; lower runs first.")
 
     class UserValves(BaseModel):
@@ -170,6 +349,7 @@ class Filter:
         __user__: Optional[dict] = None,
         __task__: Optional[str] = None,
         __metadata__: Optional[dict] = None,
+        __request__: Any = None,
     ) -> dict:
         if (
             __task__
@@ -177,14 +357,23 @@ class Filter:
             return body
         user_valves = (__user__ or {}).get("valves") or self.UserValves()
 
+        chat_id = None
+        if isinstance(__metadata__, dict):
+            chat_id = __metadata__.get("chat_id") or __metadata__.get("session_id")
+        if not chat_id:
+            chat_id = body.get("chat_id")
+        existing_plan = self._get_plan(chat_id) if chat_id else None
+
         # Independent of Kev's own scoring below: this chat has tools attached at all, so
         # push back on a reasoning model's habit of working around a tool instead of using
-        # one. Added even if the Kev call itself fails or is disabled.
-        lines = (
-            [TOOL_USE_HINT]
-            if self.valves.ENCOURAGE_TOOL_USE and self._tools_available(body, __metadata__)
-            else []
-        )
+        # one. Added even if the Kev call itself fails or is disabled. An existing plan is
+        # injected the same way, every turn, for as long as PLAN_TTL keeps it alive - it
+        # doesn't depend on Kev answering this turn either.
+        lines = []
+        if self.valves.ENCOURAGE_TOOL_USE and self._tools_available(body, __metadata__):
+            lines.append(TOOL_USE_HINT)
+        if existing_plan:
+            lines.append(self._plan_system_line(existing_plan))
 
         text = self._last_user_text(body)
         if len(text) < self.valves.MIN_CHARS:
@@ -216,6 +405,13 @@ class Filter:
             and "logic_tool" not in questions
         ):
             questions = {**questions, "logic_tool": _LOGIC_TOOL_QUESTION}
+        if (
+            self.valves.PLAN_DETECT
+            and chat_id
+            and existing_plan is None
+            and "needs_plan" not in questions
+        ):
+            questions = {**questions, "needs_plan": _NEEDS_PLAN_QUESTION}
 
         started = time.perf_counter()
         try:
@@ -257,6 +453,29 @@ class Filter:
             if self.valves.LOGIC_FORCE_TOOL_CHOICE:
                 body["tool_choice"] = "required"
 
+        needs_plan_answer = (answer.get("answers") or {}).get("needs_plan")
+        needs_plan_prob = float(needs_plan_answer["noul"]) if needs_plan_answer else None
+        if (
+            chat_id
+            and existing_plan is None
+            and needs_plan_prob is not None
+            and needs_plan_prob >= self.valves.PLAN_THRESHOLD
+        ):
+            try:
+                tasks = await self._generate_plan(
+                    __request__, body.get("model"), text, __user__
+                )
+            except Exception:  # noqa: BLE001 - fail open: no plan is not a broken chat
+                tasks = []
+            if tasks:
+                self._save_plan(chat_id, tasks)
+                lines.append(self._plan_system_line(tasks))
+                await self._status(
+                    __event_emitter__,
+                    f"Kev: plan created ({len(tasks)} step(s), p {needs_plan_prob:.3f})",
+                    user_valves,
+                )
+
         if verdict:
             lines.append(
                 f"System One (Kev) scored this message before you answered: {verdict}. "
@@ -289,6 +508,113 @@ class Filter:
         options = body.get("options")
         if isinstance(options, dict):
             options["think"] = False
+
+    # -- planning
+
+    def _get_plan(self, chat_id: str) -> Optional[list]:
+        """The plan for this chat, or None if there isn't one yet or it has expired
+        (PLAN_TTL with no new message)."""
+        entry = _CHAT_PLAN_STORE.get(chat_id)
+        if not entry:
+            return None
+        created_at, tasks = entry
+        if time.monotonic() - created_at >= self.valves.PLAN_TTL:
+            del _CHAT_PLAN_STORE[chat_id]
+            return None
+        _CHAT_PLAN_STORE.move_to_end(chat_id)
+        return tasks
+
+    def _save_plan(self, chat_id: str, tasks: list) -> None:
+        _CHAT_PLAN_STORE[chat_id] = (time.monotonic(), tasks)
+        _CHAT_PLAN_STORE.move_to_end(chat_id)
+        while len(_CHAT_PLAN_STORE) > max(0, self.valves.PLAN_MAX_CHATS):
+            _CHAT_PLAN_STORE.popitem(last=False)
+
+    @staticmethod
+    def _plan_system_line(tasks: list) -> str:
+        """The plan, phrased as background context for the model answering THIS turn -
+        not a script to narrate, restate, or complete in one go. The chat model (not
+        this filter) still drives the conversation turn by turn; the plan just keeps
+        those turns coherent with the request as a whole."""
+        steps = " | ".join(f"{t['task_id']}: {t['description']}" for t in tasks)
+        return (
+            "This chat is working from a plan drawn up earlier for the user's overall "
+            f"request: {steps}. Use it to keep this and later answers coherent with the "
+            "whole task, but answer only what the user actually asked this turn - the "
+            "plan is background context, not something to narrate, restate, or complete "
+            "all at once."
+        )
+
+    async def _generate_plan(
+        self, request: Any, model_id: str, goal: str, user_dict: Optional[dict]
+    ) -> list[dict]:
+        """One completion call to the same chat model, decomposing `goal` into a short
+        checklist ({"tasks": [{"task_id", "description"}, ...]}) - the same structured-
+        output degrade-across-backends strategy planning_standalone.py/planning_lite.py
+        use (json_schema -> json_object -> recovered from prose), trimmed to just a flat
+        list with no dependency graph or tool selection, since this is guidance for a
+        chat model answering turn by turn, not something else executing the plan."""
+        if not model_id:
+            return []
+        from open_webui.utils.chat import generate_chat_completion
+        from open_webui.models.users import Users
+
+        user = None
+        if user_dict and user_dict.get("id"):
+            user = Users.get_user_by_id(user_dict["id"])
+            if asyncio.iscoroutine(user):
+                user = await user
+
+        system_prompt = (
+            "Decompose the user's request into a short ordered checklist of the "
+            "concrete steps needed to fulfill it. Return STRICTLY a JSON object: "
+            '{"tasks": [{"task_id": "step_1", "description": "..."}, ...]}. Produce '
+            f"between 2 and {self.valves.PLAN_MAX_TASKS} steps. No prose, no "
+            "explanations, no <think> blocks."
+        )
+        base_form: dict = {
+            "model": model_id,
+            "stream": False,
+            "temperature": self.valves.PLAN_TEMPERATURE,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": goal},
+            ],
+        }
+        attempts = [
+            {
+                **base_form,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": _PLAN_JSON_SCHEMA,
+                },
+            },
+            {**base_form, "response_format": {"type": "json_object"}},
+            base_form,
+        ]
+        for form_data in attempts:
+            try:
+                response = await generate_chat_completion(request, form_data, user=user)
+            except Exception:
+                continue
+            content = _owui_extract_content(response)
+            if not content:
+                continue
+            parsed = _extract_json_object(content)
+            if not (parsed and isinstance(parsed.get("tasks"), list)):
+                continue
+            tasks: list[dict] = []
+            for idx, item in enumerate(parsed["tasks"][: self.valves.PLAN_MAX_TASKS], 1):
+                if not isinstance(item, dict):
+                    continue
+                description = str(item.get("description", "")).strip()
+                if not description:
+                    continue
+                task_id = str(item.get("task_id") or f"step_{idx}").strip()
+                tasks.append({"task_id": task_id, "description": description})
+            if tasks:
+                return tasks
+        return []
 
     # -- tool detection
 
