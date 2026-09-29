@@ -47,6 +47,23 @@ description: A switch in the message box. On, every turn is scored by Kev (Syste
 # This is a simple always-save policy, not an LLM-driven add/update/delete
 # extraction pipeline. Both directions are fail-open like everything else here.
 #
+# Strict Z3 logic verification (LOGIC_VERIFY_ENABLED)
+# ----------------------------------------------------
+# LOGIC_TOOL_DETECT's tool_choice nudge only helps if a math MCP server's tools are
+# attached to the chat and the model chooses to call one correctly - a confident small
+# model can skip it, misuse it, or just be wrong anyway. LOGIC_VERIFY_ENABLED is a
+# stricter, independent backstop: on every turn Kev flags as a logic/entailment
+# question, `outlet` (after the model's draft answer exists, before it's shown to the
+# user) asks the same chat model one more time to formalize its own draft conclusion
+# into a Z3 expression, checks that with `math_plus_mcp.py`'s `check_entailment`, and -
+# if Z3 proves the conclusion does not follow from the premises - throws the draft away
+# and asks the model again with the Z3 verdict forced into context. Runs whether or not
+# any tools are attached, and independently of the tool_choice nudge above (both can
+# fire on the same turn). Costs up to two extra completions plus one MCP call, only on
+# turns that cross LOGIC_VERIFY_THRESHOLD - fail-open throughout: a formalization
+# failure, an unreachable math MCP server, or an inconclusive Z3 result all leave the
+# draft untouched; only a positive `not_entailed` verdict changes anything.
+#
 # Cost and safety
 # ---------------
 # About a second per turn for two or three questions on a local 27B. It is
@@ -87,22 +104,43 @@ TOOL_USE_HINT = (
 _LOGIC_TOOL_QUESTION = {
     "type": "noul",
     "instructions": (
-        "Is this a formal logic, constraint-satisfaction, satisfiability, or "
-        "theorem-proving question - one a symbolic SAT/SMT solver would answer more "
-        "reliably than manual step-by-step reasoning?"
+        "Is this a formal logic, constraint-satisfaction, satisfiability, algebraic "
+        "identity/inequality, or number-theory proof question - one where a symbolic "
+        "SAT/SMT solver like Z3 could verify sub-claims, check small cases, search for a "
+        "counterexample, or confirm a derived equation, more reliably than working it "
+        "out purely by hand?"
     ),
     "criteria": {
         "true": (
-            "a logic puzzle, a consistency/contradiction check, proving an "
-            "entailment, satisfying a set of constraints, or a case-by-case riddle "
-            "that formal search would settle quickly"
+            "a logic puzzle, a consistency/contradiction check, proving an entailment, "
+            "satisfying a set of constraints, a case-by-case riddle, or an algebraic/"
+            "number-theory proof (e.g. 'prove X is a perfect square', 'show that ... is "
+            "divisible by ...', a Diophantine equation, an inequality to verify) where "
+            "formal/symbolic checking would help even if the full argument still needs "
+            "some manual reasoning around it"
         ),
         "false": (
-            "ordinary factual, creative, or open-ended reasoning that does not "
-            "reduce to formal constraints"
+            "ordinary factual, creative, or open-ended reasoning that does not reduce "
+            "to a formal constraint or a checkable mathematical claim at all"
         ),
     },
 }
+
+# Deterministic backstop for LOGIC_TOOL_DETECT: Kev's own classifier can misjudge a
+# proof-shaped problem as not "formal enough" and never push the model toward a tool at
+# all (observed: an IMO-style Vieta-jumping number-theory proof scored logic_tool at
+# p=0.077, well under threshold, so the model free-reasoned for hundreds of lines
+# instead of ever touching Z3). These phrases mark a problem where a symbolic solver
+# could at least verify sub-claims, check small cases, or search for a counterexample -
+# matching one forces the tool_choice nudge below independently of Kev's probability,
+# so a single misjudged score can't be the only thing standing between the model and a
+# tool call.
+_FORMAL_MATH_RE = re.compile(
+    r"\b(prove|show that|verify that|determine all|find all|perfect square|"
+    r"is divisible by|divides|integer solutions?|is an integer\b|is a square\b|"
+    r"there exists?\b|for all\b)",
+    re.IGNORECASE,
+)
 
 # Packed into the same Kev call as everything else above when PLAN_DETECT is on and no
 # plan exists yet for this chat (see Filter._get_plan). Only asked once per chat: once a
@@ -173,6 +211,25 @@ _PLAN_JSON_SCHEMA: dict = {
     },
 }
 
+# The structured-output schema for LOGIC_VERIFY_ENABLED's formalization step: asks the
+# chat model to translate the user's question and its own draft conclusion into
+# math_plus_mcp.py's check_entailment grammar, or say the question isn't a formal claim at
+# all. Same degrade-across-backends role as _PLAN_JSON_SCHEMA above.
+_ENTAILMENT_JSON_SCHEMA: dict = {
+    "name": "entailment_check",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "formalizable": {"type": "boolean"},
+            "premises": {"type": "array", "items": {"type": "string"}},
+            "conclusion": {"type": "string"},
+        },
+        "required": ["formalizable", "premises", "conclusion"],
+        "additionalProperties": False,
+    },
+}
+
 # chat_id -> (created_at, tasks). LRU-evicted (PLAN_MAX_CHATS) and TTL-expired
 # (PLAN_TTL), same pattern as the Kev answer cache below.
 _CHAT_PLAN_STORE: "OrderedDict[str, tuple]" = OrderedDict()
@@ -185,6 +242,12 @@ _CHAT_PLAN_STORE: "OrderedDict[str, tuple]" = OrderedDict()
 _CHAT_SAVE_DECISION_STORE: "OrderedDict[str, tuple]" = OrderedDict()
 _SAVE_DECISION_TTL = 300.0
 _SAVE_DECISION_MAX_CHATS = 500
+
+# chat_id -> (created_at, logic_prob, question_text). Same bridge pattern as
+# _CHAT_SAVE_DECISION_STORE, for LOGIC_VERIFY_ENABLED's outlet-time Z3 check.
+_CHAT_LOGIC_VERIFY_STORE: "OrderedDict[str, tuple]" = OrderedDict()
+_LOGIC_VERIFY_TTL = 300.0
+_LOGIC_VERIFY_MAX_CHATS = 500
 
 
 def _strip_think_blocks(text: str) -> str:
@@ -290,13 +353,16 @@ def _owui_extract_content(response: Any) -> str:
     return ""
 
 
-class _MCPMemoryClient:
-    """Minimal async client for the mcp-memory FastMCP streamable-HTTP endpoint.
+class _MCPToolClient:
+    """Minimal async client for an MCP FastMCP streamable-HTTP endpoint.
 
     Implements just enough of the MCP Streamable HTTP transport to perform the
-    `initialize` -> `notifications/initialized` -> `tools/call` handshake
-    against `mcp_memory/server.py`. Used as an async context manager so a
-    single session is reused for the handful of calls made per turn.
+    `initialize` -> `notifications/initialized` -> `tools/call` handshake.
+    Generic - not memory-specific - so it's reused for both the mcp-memory
+    server (`mcp_memory/server.py`, `retrieve`/`remember`) and the math MCP
+    server (`math/math_plus_mcp.py`, `check_entailment`). Used as an async
+    context manager so a single session is reused for the handful of calls
+    made per turn.
     """
 
     PROTOCOL_VERSION = "2025-06-18"
@@ -309,7 +375,7 @@ class _MCPMemoryClient:
         self._session_id: Optional[str] = None
         self._request_id = 0
 
-    async def __aenter__(self) -> "_MCPMemoryClient":
+    async def __aenter__(self) -> "_MCPToolClient":
         self._session = aiohttp.ClientSession(timeout=self._timeout)
         await self._initialize()
         return self
@@ -488,12 +554,36 @@ class Filter:
             description="Comma-separated candidate tool names for the instruction when LOGIC_TOOL_DETECT fires - covers math/math_plus_mcp.py (the z3_*/check_* tools), math/math_solver_mcp.py (solve_equation, solve_matrix_equation), and mcp_memory/server.py (retrieve, remember - useful when the constraints/facts needed to solve the problem may already be stored). Only the ones actually attached to this chat are named; if none of these servers' tools can be detected as attached, the full list is named as a fallback.",
         )
         LOGIC_TOOL_THRESHOLD: float = Field(
-            default=0.5,
-            description="Minimum Kev probability to treat the message as a formal-logic question.",
+            default=0.35,
+            description="Minimum Kev probability to treat the message as a formal-logic question. Lowered from 0.5: Kev's own classifier can under-score a proof-shaped problem (observed p=0.077 on an IMO-style number-theory proof), so a lower bar plus LOGIC_TOOL_KEYWORD_BACKSTOP catches more of what a symbolic solver could actually help with.",
+        )
+        LOGIC_TOOL_KEYWORD_BACKSTOP: bool = Field(
+            default=True,
+            description="Force the tool_choice nudge below even when Kev's own logic_tool score misses LOGIC_TOOL_THRESHOLD, if the message matches a deterministic 'this looks like a formal proof/claim' phrase list (prove, show that, perfect square, divisible by, ...). A single misjudged classifier score should not be the only thing standing between the model and a tool call.",
         )
         LOGIC_FORCE_TOOL_CHOICE: bool = Field(
             default=True,
-            description="Also set tool_choice to force a tool call this turn when LOGIC_TOOL_DETECT fires, instead of only instructing the model to use one. Needed in practice - a confident model ignores a plain instruction to use a tool it doesn't feel it needs; only forcing tool_choice reliably gets the call made. Can misfire if no attached tool actually fits the request.",
+            description="Also set tool_choice to force a tool call this turn when LOGIC_TOOL_DETECT fires, instead of only instructing the model to use one. Needed in practice - a confident model ignores a plain instruction to use a tool it doesn't feel it needs; only forcing tool_choice reliably gets the call made. Forces a specific tool by name when exactly one candidate tool is attached (more reliably obeyed by most backends than a bare 'required'), or 'required' when several are attached and it isn't clear which one fits. Can misfire if no attached tool actually fits the request.",
+        )
+        LOGIC_VERIFY_ENABLED: bool = Field(
+            default=True,
+            description="Independent of LOGIC_TOOL_DETECT's nudge (which only helps if math tools are attached and the model chooses to call one correctly): on every turn Kev flags as a logic/entailment question, kev.py itself formalizes the model's draft conclusion and checks it with Z3 (math_plus_mcp.py's check_entailment) in outlet, before the answer is shown to the user - and rewrites it if Z3 finds it unsupported. Runs whether or not any tools are attached to the chat.",
+        )
+        MATH_MCP_URL: str = Field(
+            default="http://10.0.0.10:2000/math",
+            description="Base URL of the math MCP FastMCP streamable-HTTP endpoint (math/math_plus_mcp.py), used for LOGIC_VERIFY_ENABLED's own check_entailment call.",
+        )
+        MATH_MCP_TIMEOUT: float = Field(
+            default=15.0,
+            description="Seconds to wait for the math MCP server before treating LOGIC_VERIFY_ENABLED's Z3 check as unavailable for this turn (fails open: draft answer left as-is).",
+        )
+        LOGIC_VERIFY_THRESHOLD: float = Field(
+            default=0.5,
+            description="Minimum Kev logic_tool probability to run the LOGIC_VERIFY_ENABLED formalize-and-check pass. Separate from LOGIC_TOOL_THRESHOLD since one is a cheap hint and the other an extra two LLM round-trips plus a Z3 call.",
+        )
+        LOGIC_VERIFY_TEMPERATURE: float = Field(
+            default=0.1,
+            description="Sampling temperature for the formalization and correction completions LOGIC_VERIFY_ENABLED makes. Kept low: these need deterministic Z3 syntax and a careful corrected answer, not creative variation.",
         )
         EXPLICIT_TOOL_FORCE: bool = Field(
             default=True,
@@ -700,9 +790,11 @@ class Filter:
 
         if (
             self.valves.LOGIC_TOOL_DETECT
-            and tools_available
+            and (tools_available or self.valves.LOGIC_VERIFY_ENABLED)
             and "logic_tool" not in questions
         ):
+            # Asked even with no tools attached when LOGIC_VERIFY_ENABLED: that pass
+            # doesn't need an attached tool - kev.py calls the math MCP server itself.
             questions = {**questions, "logic_tool": _LOGIC_TOOL_QUESTION}
         if (
             self.valves.PLAN_DETECT
@@ -741,7 +833,19 @@ class Filter:
 
         logic_answer = (answer.get("answers") or {}).get("logic_tool")
         logic_prob = float(logic_answer["noul"]) if logic_answer else None
-        if logic_prob is not None and logic_prob >= self.valves.LOGIC_TOOL_THRESHOLD:
+        logic_score_flagged = (
+            logic_prob is not None and logic_prob >= self.valves.LOGIC_TOOL_THRESHOLD
+        )
+        # Kev's classifier misjudging a proof-shaped problem (e.g. p=0.077 on an
+        # IMO-style number-theory proof) must not be the only thing standing between the
+        # model and a tool call - a deterministic phrase match forces the same nudge.
+        keyword_flagged = (
+            self.valves.LOGIC_TOOL_DETECT
+            and tools_available
+            and self.valves.LOGIC_TOOL_KEYWORD_BACKSTOP
+            and bool(_FORMAL_MATH_RE.search(text))
+        )
+        if logic_score_flagged or keyword_flagged:
             self._disable_thinking(body)
             candidate_names = [
                 n.strip() for n in self.valves.LOGIC_TOOL_NAMES.split(",") if n.strip()
@@ -753,15 +857,39 @@ class Filter:
             tool_names = [
                 n for n in candidate_names if n in attached
             ] or candidate_names
+            if logic_prob is not None and keyword_flagged and not logic_score_flagged:
+                # Kev's own score missed the threshold - say so, so it's visible in the
+                # system prompt (and to anyone reading logs) that the keyword backstop is
+                # what actually triggered this, not Kev's classifier.
+                score_label = f"p {logic_prob:.3f}, keyword match"
+            elif logic_prob is not None:
+                score_label = f"p {logic_prob:.3f}"
+            else:
+                score_label = "keyword match"
             lines.append(
-                f"System One (Kev) flagged this as a formal logic/constraint problem "
-                f"(p {logic_prob:.3f}). Skip extended step-by-step reasoning by hand and "
-                f"call one of these tools right away instead: {', '.join(tool_names)}. "
+                f"System One (Kev) flagged this as a formal logic/constraint/proof "
+                f"problem ({score_label}). Skip extended step-by-step reasoning by hand "
+                f"and call one of these tools right away instead: {', '.join(tool_names)}. "
                 "They run Z3 (SAT/SMT) and will be more reliable than manual deduction, "
                 "especially with multiple constraints, cases, or a proof obligation."
             )
             if self.valves.LOGIC_FORCE_TOOL_CHOICE:
-                body["tool_choice"] = "required"
+                # A specific function name is more reliably obeyed than a bare
+                # "required" by most backends - only fall back to "required" when it
+                # isn't clear which single attached tool actually fits.
+                if len(tool_names) == 1 and tool_names[0] in attached:
+                    body["tool_choice"] = {
+                        "type": "function",
+                        "function": {"name": tool_names[0]},
+                    }
+                else:
+                    body["tool_choice"] = "required"
+
+        # Independent of the nudge above (which only fires with tools attached): bridge
+        # this turn's logic verdict to `outlet`, which runs the actual Z3 check itself once
+        # the model's draft answer exists, regardless of whether any tool got called.
+        if self.valves.LOGIC_VERIFY_ENABLED and chat_id and logic_prob is not None:
+            self._set_logic_verify_decision(chat_id, logic_prob, text)
 
         needs_plan_answer = (answer.get("answers") or {}).get("needs_plan")
         needs_plan_prob = (
@@ -818,34 +946,55 @@ class Filter:
         __user__: Optional[dict] = None,
         __task__: Optional[str] = None,
         __metadata__: Optional[dict] = None,
+        __request__: Any = None,
     ) -> dict:
-        """The user's latest message goes back to mcp-memory via `remember` once
-        the model has answered - gated by Kev's should_save verdict from the
-        matching `inlet` call when MCP_MEMORY_SAVE_DETECT is on, otherwise
-        always saved. No LLM-driven add/update/delete extraction - dedup beyond
-        mcp-memory's own content-hash/near-duplicate checks is out of scope
-        here."""
+        """Two independent post-answer passes, neither gating the other:
+
+        - mcp-memory save: the user's latest message goes back via `remember` once the
+          model has answered - gated by Kev's should_save verdict from the matching
+          `inlet` call when MCP_MEMORY_SAVE_DETECT is on, otherwise always saved.
+        - Z3 logic verification (LOGIC_VERIFY_ENABLED): if `inlet` flagged this turn as a
+          logic/entailment question, formalizes the model's draft conclusion and checks it
+          against math_plus_mcp.py's check_entailment, rewriting the draft if Z3 finds it
+          unsupported. See _verify_logic_and_correct.
+        """
         if __task__:
             return body
         user_valves = (__user__ or {}).get("valves") or self.UserValves()
 
-        if not (
-            self.valves.MEMORY_ENABLED and getattr(user_valves, "memory_enabled", True)
-        ):
-            return body
+        chat_id = None
+        if isinstance(__metadata__, dict):
+            chat_id = __metadata__.get("chat_id") or __metadata__.get("session_id")
+        if not chat_id:
+            chat_id = body.get("chat_id")
 
+        if self.valves.MEMORY_ENABLED and getattr(user_valves, "memory_enabled", True):
+            await self._save_memory_if_worthwhile(
+                body, chat_id, __event_emitter__, user_valves, __user__
+            )
+
+        if self.valves.LOGIC_VERIFY_ENABLED:
+            await self._verify_logic_if_flagged(
+                body, chat_id, __event_emitter__, user_valves, __request__, __user__
+            )
+
+        return body
+
+    async def _save_memory_if_worthwhile(
+        self,
+        body: dict,
+        chat_id: Optional[str],
+        emitter,
+        user_valves,
+        user_dict: Optional[dict],
+    ) -> None:
         text = self._last_user_text(body)
         if len(text) < self.valves.MCP_MEMORY_MIN_CHARS:
-            return body
+            return
 
         status_suffix = ""
         importance_probability: Optional[float] = None
         if self.valves.MCP_MEMORY_SAVE_DETECT:
-            chat_id = None
-            if isinstance(__metadata__, dict):
-                chat_id = __metadata__.get("chat_id") or __metadata__.get("session_id")
-            if not chat_id:
-                chat_id = body.get("chat_id")
             decision = self._pop_save_decision(chat_id) if chat_id else None
             # decision is None when Kev never answered should_save this turn (message
             # under MIN_CHARS, Kev unreachable, missing chat_id) - fail open and fall
@@ -855,18 +1004,18 @@ class Filter:
                 status_suffix = f" (Kev p {probability:.3f})"
                 if not should_save:
                     await self._status(
-                        __event_emitter__,
+                        emitter,
                         f"Memory: Kev decided this wasn't worth saving{status_suffix}",
                         user_valves,
                     )
-                    return body
+                    return
                 importance_probability = probability
 
         try:
-            memory_user_id = self._resolve_memory_user_id(__user__)
+            memory_user_id = self._resolve_memory_user_id(user_dict)
             await self._save_memory(text, memory_user_id, importance_probability)
             await self._status(
-                __event_emitter__,
+                emitter,
                 f"Memory: saved this message{status_suffix}",
                 user_valves,
             )
@@ -874,11 +1023,44 @@ class Filter:
             Exception
         ) as exception:  # noqa: BLE001 - fail open: never block the reply on memory
             await self._status(
-                __event_emitter__,
+                emitter,
                 f"Memory MCP unavailable ({type(exception).__name__}); message not saved",
                 user_valves,
             )
-        return body
+
+    async def _verify_logic_if_flagged(
+        self,
+        body: dict,
+        chat_id: Optional[str],
+        emitter,
+        user_valves,
+        request: Any,
+        user_dict: Optional[dict],
+    ) -> None:
+        decision = self._pop_logic_verify_decision(chat_id) if chat_id else None
+        if decision is None:
+            return
+        probability, question_text = decision
+        try:
+            outcome = await self._verify_logic_and_correct(
+                request, body, question_text, user_dict
+            )
+        except (
+            Exception
+        ):  # noqa: BLE001 - fail open: a broken verification pass must not break the chat
+            outcome = None
+        if outcome is True:
+            await self._status(
+                emitter,
+                f"Kev: Z3 found the conclusion unsupported (p {probability:.3f}) - answer corrected",
+                user_valves,
+            )
+        elif outcome is False:
+            await self._status(
+                emitter,
+                f"Kev: conclusion verified by Z3 (p {probability:.3f})",
+                user_valves,
+            )
 
     @staticmethod
     def _disable_thinking(body: dict) -> None:
@@ -945,6 +1127,37 @@ class Filter:
         if time.monotonic() - created_at >= _SAVE_DECISION_TTL:
             return None
         return should_save, probability
+
+    # -- logic verification (LOGIC_VERIFY_ENABLED) gating
+
+    @staticmethod
+    def _set_logic_verify_decision(
+        chat_id: str, probability: float, question_text: str
+    ) -> None:
+        """Record this turn's Kev logic_tool verdict so the matching `outlet` call
+        (same chat, once the model's draft answer exists) can formalize and check it
+        with Z3, regardless of whether any tool ended up attached or called."""
+        _CHAT_LOGIC_VERIFY_STORE[chat_id] = (
+            time.monotonic(),
+            probability,
+            question_text,
+        )
+        _CHAT_LOGIC_VERIFY_STORE.move_to_end(chat_id)
+        while len(_CHAT_LOGIC_VERIFY_STORE) > _LOGIC_VERIFY_MAX_CHATS:
+            _CHAT_LOGIC_VERIFY_STORE.popitem(last=False)
+
+    @staticmethod
+    def _pop_logic_verify_decision(chat_id: str) -> Optional[tuple]:
+        """Consume this turn's logic_tool verdict, if Kev answered it in time.
+        Returns None (fail open, caller skips Z3 verification this turn) when there
+        is nothing recorded or it aged out before the model finished."""
+        entry = _CHAT_LOGIC_VERIFY_STORE.pop(chat_id, None)
+        if not entry:
+            return None
+        created_at, probability, question_text = entry
+        if time.monotonic() - created_at >= _LOGIC_VERIFY_TTL:
+            return None
+        return probability, question_text
 
     @staticmethod
     def _plan_system_line(tasks: list) -> str:
@@ -1034,6 +1247,207 @@ class Filter:
                 return tasks
         return []
 
+    # -- logic verification (LOGIC_VERIFY_ENABLED)
+
+    async def _verify_logic_and_correct(
+        self,
+        request: Any,
+        body: dict,
+        question_text: str,
+        user_dict: Optional[dict],
+    ) -> Optional[bool]:
+        """Formalizes the model's own draft conclusion and checks it against
+        math_plus_mcp.py's check_entailment. Returns True if the draft was rewritten
+        (Z3 found it unsupported), False if Z3 confirmed it (left untouched), or None
+        if inconclusive/skipped (not formalizable, an invalid/unknown Z3 result, or any
+        step failed) - the draft is left untouched either way, None just changes the
+        outlet status line."""
+        messages = body.get("messages") or []
+        assistant_index = self._last_assistant_message_index(messages)
+        if assistant_index is None:
+            return None
+        draft = self._message_text(messages[assistant_index].get("content"))
+        if not draft:
+            return None
+        model_id = body.get("model")
+        if not model_id:
+            return None
+
+        formal = await self._formalize_for_z3(
+            request, model_id, question_text, draft, user_dict
+        )
+        if not formal:
+            return None
+        premises = [str(p) for p in (formal.get("premises") or []) if str(p).strip()]
+        conclusion = str(formal.get("conclusion") or "").strip()
+        if not premises or not conclusion:
+            return None
+
+        verdict = await self._check_entailment(premises, conclusion)
+        status = verdict.get("status")
+        if status == "entailed":
+            return False
+        if status != "not_entailed":
+            # invalid_expression, unknown, or anything else - the formalization or the
+            # solver itself was inconclusive, not a confirmed contradiction. Don't
+            # rewrite a possibly-correct answer just because it couldn't be formally
+            # checked.
+            return None
+
+        counterexample = (verdict.get("value") or {}).get("counterexample")
+        corrected = await self._regenerate_with_z3_verdict(
+            request,
+            model_id,
+            messages[:assistant_index],
+            premises,
+            conclusion,
+            counterexample,
+            user_dict,
+        )
+        if corrected:
+            new_content = corrected
+        else:
+            # Regeneration itself failed - still surface the Z3 finding rather than
+            # silently serving a refuted conclusion with no signal at all.
+            caution = (
+                "\n\n[Kev: Z3 checked this conclusion formally against the stated "
+                "premises and found it does not follow"
+                + (f" (counterexample: {counterexample})" if counterexample else "")
+                + ". Treat the conclusion above with caution.]"
+            )
+            new_content = draft + caution
+        messages[assistant_index] = {**messages[assistant_index], "content": new_content}
+        body["messages"] = messages
+        return True
+
+    async def _formalize_for_z3(
+        self,
+        request: Any,
+        model_id: str,
+        question: str,
+        draft_answer: str,
+        user_dict: Optional[dict],
+    ) -> Optional[dict]:
+        """One completion call translating the user's question and the model's own
+        draft conclusion into math_plus_mcp.py's check_entailment grammar - the same
+        degrade-across-backends strategy _generate_plan uses (json_schema -> json_object
+        -> recovered from prose). Returns None if the model says the question isn't a
+        formalizable claim, or if every attempt fails."""
+        from open_webui.utils.chat import generate_chat_completion
+        from open_webui.models.users import Users
+
+        user = None
+        if user_dict and user_dict.get("id"):
+            user = Users.get_user_by_id(user_dict["id"])
+            if asyncio.iscoroutine(user):
+                user = await user
+
+        system_prompt = (
+            "You translate a question and a draft conclusion into a formal entailment "
+            "check for a Z3 SMT solver. Extract the premises implied or stated by the "
+            "question, and the specific conclusion the draft answer reaches, as "
+            "boolean/arithmetic expressions.\n\n"
+            "Supported grammar: ==, !=, <=, >=, <, >, +, -, *, /, Implies, and boolean "
+            "combinators as lowercase infix and/or/not (preferred - e.g. `x == 1 or "
+            "x == 2`) or the capitalized Z3 functions And(...)/Or(...)/Not(...) (NOT as "
+            "infix - `a Or b` is invalid; call it Or(a, b)).\n\n"
+            'Return STRICTLY a JSON object: {"formalizable": true|false, "premises": '
+            '["..."], "conclusion": "..."}. Set "formalizable" to false (with empty '
+            "premises/conclusion) if the question and draft don't reduce to a formal "
+            "claim expressible in this grammar - don't force it. No prose, no "
+            "explanations, no <think> blocks."
+        )
+        user_content = f"Question: {question}\n\nDraft answer to verify: {draft_answer}"
+        base_form: dict = {
+            "model": model_id,
+            "stream": False,
+            "temperature": self.valves.LOGIC_VERIFY_TEMPERATURE,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+        }
+        attempts = [
+            {
+                **base_form,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": _ENTAILMENT_JSON_SCHEMA,
+                },
+            },
+            {**base_form, "response_format": {"type": "json_object"}},
+            base_form,
+        ]
+        for form_data in attempts:
+            try:
+                response = await generate_chat_completion(request, form_data, user=user)
+            except Exception:
+                continue
+            content = _owui_extract_content(response)
+            if not content:
+                continue
+            parsed = _extract_json_object(content)
+            if not isinstance(parsed, dict):
+                continue
+            if not parsed.get("formalizable"):
+                return None
+            return parsed
+        return None
+
+    async def _check_entailment(self, premises: list[str], conclusion: str) -> dict:
+        async with _MCPToolClient(
+            self.valves.MATH_MCP_URL, timeout=self.valves.MATH_MCP_TIMEOUT
+        ) as mcp:
+            result = await mcp.call_tool(
+                "check_entailment", {"premises": premises, "claim": conclusion}
+            )
+        return result if isinstance(result, dict) else {}
+
+    async def _regenerate_with_z3_verdict(
+        self,
+        request: Any,
+        model_id: str,
+        prior_messages: list,
+        premises: list[str],
+        conclusion: str,
+        counterexample: Any,
+        user_dict: Optional[dict],
+    ) -> Optional[str]:
+        """One more completion call, replaying the conversation up to (but not
+        including) the flawed draft, with a system message stating the Z3 verdict and
+        asking for a corrected final answer. Returns the new content, or None if this
+        call itself fails - the caller then falls back to appending a caution note to
+        the original draft rather than losing the Z3 finding entirely."""
+        from open_webui.utils.chat import generate_chat_completion
+        from open_webui.models.users import Users
+
+        user = None
+        if user_dict and user_dict.get("id"):
+            user = Users.get_user_by_id(user_dict["id"])
+            if asyncio.iscoroutine(user):
+                user = await user
+
+        verdict_line = (
+            "A prior draft answer to this question was checked with a Z3 SMT solver "
+            f"against these premises: {premises}. It concluded: {conclusion!r}. Z3 "
+            "proved this conclusion does NOT follow from the premises"
+            + (f", counterexample: {counterexample}" if counterexample else "")
+            + ". Do not repeat the same conclusion - work out and give a corrected "
+            "final answer that is actually consistent with the premises."
+        )
+        form_data: dict = {
+            "model": model_id,
+            "stream": False,
+            "temperature": self.valves.LOGIC_VERIFY_TEMPERATURE,
+            "messages": [*prior_messages, {"role": "system", "content": verdict_line}],
+        }
+        try:
+            response = await generate_chat_completion(request, form_data, user=user)
+        except Exception:
+            return None
+        content = _owui_extract_content(response)
+        return content.strip() if content else None
+
     # -- tool detection
 
     @staticmethod
@@ -1120,7 +1534,7 @@ class Filter:
         return (user or {}).get("id", "default")
 
     async def _retrieve_memories(self, query: str, user_id: str) -> list:
-        async with _MCPMemoryClient(
+        async with _MCPToolClient(
             self.valves.MCP_MEMORY_URL,
             self.valves.MCP_MEMORY_SECURITY_KEY,
             self.valves.MCP_MEMORY_TIMEOUT,
@@ -1162,7 +1576,7 @@ class Filter:
                 arguments["ttl_days"] = None
             else:
                 arguments["ttl_days"] = self.valves.MCP_MEMORY_TTL_DAYS
-        async with _MCPMemoryClient(
+        async with _MCPToolClient(
             self.valves.MCP_MEMORY_URL,
             self.valves.MCP_MEMORY_SECURITY_KEY,
             self.valves.MCP_MEMORY_TIMEOUT,
@@ -1184,17 +1598,30 @@ class Filter:
     # -- shaping
 
     @staticmethod
-    def _last_user_text(body: dict) -> str:
+    def _message_text(content: Any) -> str:
+        """A message's content as plain text, joining multimodal parts' text
+        fields - shared by both _last_user_text and the logic-verification
+        pass's read of the assistant's draft answer."""
+        content = content or ""
+        if isinstance(content, list):  # multimodal: Kev reads the text parts
+            content = "\n".join(
+                part.get("text", "") for part in content if isinstance(part, dict)
+            )
+        return content.strip()
+
+    @classmethod
+    def _last_user_text(cls, body: dict) -> str:
         for message in reversed(body.get("messages", [])):
-            if message.get("role") != "user":
-                continue
-            content = message.get("content") or ""
-            if isinstance(content, list):  # multimodal: Kev reads the text parts
-                content = "\n".join(
-                    part.get("text", "") for part in content if isinstance(part, dict)
-                )
-            return content.strip()
+            if message.get("role") == "user":
+                return cls._message_text(message.get("content"))
         return ""
+
+    @staticmethod
+    def _last_assistant_message_index(messages: list) -> Optional[int]:
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index].get("role") == "assistant":
+                return index
+        return None
 
     @staticmethod
     def _verdict(answer: dict) -> str:
