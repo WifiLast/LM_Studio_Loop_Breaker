@@ -3,7 +3,7 @@ title: Kev mode
 author: local
 version: 0.3.0
 required_open_webui_version: 0.11.0
-description: A switch in the message box. On, every turn is scored by Kev (System One) before the chat model answers, and the verdict goes into the system prompt. It also retrieves relevant long-term memories from the mcp-memory server and injects them, then asks Kev whether the message is worth remembering and saves it back to mcp-memory afterwards if so. Off, nothing runs and the chat is exactly as before.
+description: A switch in the message box. On, every turn is scored by Kev (System One) before the chat model answers, and the verdict goes into the system prompt. It also retrieves relevant long-term memories from the mcp-memory server and injects them, then asks Kev whether the message is worth remembering and saves it back to mcp-memory afterwards if so - and separately asks Kev whether the message contains structured facts/relationships worth extracting, running them through the relation_extractor MCP server and saving the resulting triples to mcp-memory if so. Off, nothing runs and the chat is exactly as before.
 """
 
 # Why a toggle filter
@@ -46,6 +46,22 @@ description: A switch in the message box. On, every turn is scored by Kev (Syste
 # mcp-memory server itself does (content-hash dedup, near-duplicate detection).
 # This is a simple always-save policy, not an LLM-driven add/update/delete
 # extraction pipeline. Both directions are fail-open like everything else here.
+#
+# Relation extraction (RELATION_EXTRACT_ENABLED)
+# ------------------------------------------------
+# A second, independent use of Kev's own scoring on `inlet`: alongside should_save (is this
+# worth remembering verbatim?), Kev also answers should_extract_relations - does this message
+# state concrete facts/entities/relationships worth pulling out as structured subject-
+# relation-object triples, rather than just remembered as a blob of text? If so, the verdict
+# is bridged to `outlet` the same way should_save is, and once the model has answered,
+# `outlet` sends the user's message to the relation_extractor MCP server's
+# `extract_relations_tool` (other/relation_extractor/z3_backend.py - L5 neural extraction via
+# ReLiK + GLiREL, falling back to a spaCy/NLTK SVO pass) and saves each resulting triple back
+# to mcp-memory via `remember`, same as should_save's plain-text save. Gated behind detection
+# rather than run on every turn because the neural pass is markedly more expensive than a
+# memory lookup or a `remember` call. Fail-open throughout: an unreachable relation_extractor,
+# a missing Kev verdict, or a save failure on one triple never blocks the reply or drops the
+# rest.
 #
 # Strict Z3 logic verification (LOGIC_VERIFY_ENABLED)
 # ----------------------------------------------------
@@ -183,6 +199,32 @@ _SHOULD_SAVE_QUESTION = {
     },
 }
 
+# Packed into the same Kev call as everything else above when RELATION_EXTRACT_DETECT is
+# on. Distinct from should_save above: should_save asks whether the message is worth
+# remembering as a blob of text at all, this asks whether it additionally has enough
+# structure (named entities and how they relate) to be worth running through the neural
+# relation_extractor MCP server (other/relation_extractor) and saving as discrete triples.
+_SHOULD_EXTRACT_RELATIONS_QUESTION = {
+    "type": "noul",
+    "instructions": (
+        "Does this message state concrete facts, entities, quantities, or relationships "
+        "(e.g. 'X is part of Y', 'A controls B', a measurement, a spec, an org/ownership "
+        "structure) that would be worth pulling out as structured subject-relation-object "
+        "facts, rather than just remembered as a blob of text?"
+    ),
+    "criteria": {
+        "true": (
+            "concrete factual content describing named entities and how they relate - "
+            "specs, definitions, ownership/composition, locations, measurements, or a "
+            "procedure with named actors and objects"
+        ),
+        "false": (
+            "small talk, opinions, questions, or content with no named entities or "
+            "extractable relationships between them"
+        ),
+    },
+}
+
 # The structured-output schema for plan generation (LM Studio / OpenAI json_schema mode),
 # trimmed to just what's injected as guidance: a short ordered checklist, no dependency
 # graph or tool selection - this is a hint for the chat model answering turn by turn, not
@@ -248,6 +290,12 @@ _SAVE_DECISION_MAX_CHATS = 500
 _CHAT_LOGIC_VERIFY_STORE: "OrderedDict[str, tuple]" = OrderedDict()
 _LOGIC_VERIFY_TTL = 300.0
 _LOGIC_VERIFY_MAX_CHATS = 500
+
+# chat_id -> (created_at, should_extract, probability). Same bridge pattern as
+# _CHAT_SAVE_DECISION_STORE, for RELATION_EXTRACT_ENABLED's outlet-time relation_extractor call.
+_CHAT_RELATION_EXTRACT_STORE: "OrderedDict[str, tuple]" = OrderedDict()
+_RELATION_EXTRACT_TTL = 300.0
+_RELATION_EXTRACT_MAX_CHATS = 500
 
 
 def _strip_think_blocks(text: str) -> str:
@@ -672,6 +720,44 @@ class Filter:
             description="TTL applied to memories that clear MCP_MEMORY_SAVE_THRESHOLD but not MCP_MEMORY_IMPORTANCE_HIGH_THRESHOLD. Memories at/above the high-importance threshold are stored with no TTL (never expire).",
         )
 
+        # -- relation extraction (other/relation_extractor) --
+        RELATION_EXTRACT_ENABLED: bool = Field(
+            default=True,
+            description="Turn relation-extraction detection + auto-save on/off (still requires MEMORY_ENABLED, since extracted relations are stored via mcp-memory's remember tool).",
+        )
+        RELATION_EXTRACTOR_URL: str = Field(
+            default="http://10.0.0.10:2006/relation",
+            description="Base URL of the relation_extractor FastMCP streamable-HTTP endpoint (other/relation_extractor/z3_backend.py's extract_relations_tool).",
+        )
+        RELATION_EXTRACTOR_SECURITY_KEY: str = Field(
+            default="",
+            description="Security key for the relation_extractor server, only needed if configured server-side. Empty = disabled.",
+        )
+        RELATION_EXTRACTOR_TIMEOUT: float = Field(
+            default=30.0,
+            description="Seconds to wait for extract_relations_tool before giving up - the L5 neural pass (ReLiK+GLiREL) is slower than a plain memory lookup. Fails open: the message just isn't extracted this turn.",
+        )
+        RELATION_EXTRACT_DETECT: bool = Field(
+            default=True,
+            description="Ask Kev whether a message contains structured facts/relationships worth extracting, and only call the relation_extractor when it says yes, instead of running the comparatively expensive neural pass on every message.",
+        )
+        RELATION_EXTRACT_THRESHOLD: float = Field(
+            default=0.5,
+            description="Minimum Kev probability to treat a message as worth extracting when RELATION_EXTRACT_DETECT is on.",
+        )
+        RELATION_EXTRACT_MIN_SCORE: float = Field(
+            default=0.5,
+            description="Minimum per-relation score from extract_relations_tool's L5 (ReLiK/GLiREL) output for a triple to be kept and saved. Ignored for legacy spaCy/NLTK fallback triples, which carry no score.",
+        )
+        RELATION_EXTRACT_MAX_RELATIONS: int = Field(
+            default=10,
+            description="Max relation triples saved to memory per message, highest-scoring first.",
+        )
+        RELATION_EXTRACT_MEMORY_TYPE: str = Field(
+            default="fact",
+            description="Memory `type` used when saving an extracted relation triple to mcp-memory (kept distinct from MCP_MEMORY_TYPE, which is used for the plain-text should_save memory).",
+        )
+
     class UserValves(BaseModel):
         questions: str = Field(
             default="",
@@ -683,6 +769,10 @@ class Filter:
         memory_enabled: bool = Field(
             default=True,
             description="Retrieve relevant memories and auto-save my messages via mcp-memory.",
+        )
+        relation_extract_enabled: bool = Field(
+            default=True,
+            description="Extract structured facts/relationships from my messages via the relation_extractor MCP server and save them to mcp-memory.",
         )
 
     def __init__(self):
@@ -810,6 +900,18 @@ class Filter:
             and "should_save" not in questions
         ):
             questions = {**questions, "should_save": _SHOULD_SAVE_QUESTION}
+        if (
+            self.valves.MEMORY_ENABLED
+            and self.valves.RELATION_EXTRACT_ENABLED
+            and self.valves.RELATION_EXTRACT_DETECT
+            and getattr(user_valves, "memory_enabled", True)
+            and getattr(user_valves, "relation_extract_enabled", True)
+            and "should_extract_relations" not in questions
+        ):
+            questions = {
+                **questions,
+                "should_extract_relations": _SHOULD_EXTRACT_RELATIONS_QUESTION,
+            }
 
         started = time.perf_counter()
         try:
@@ -923,6 +1025,17 @@ class Filter:
                 chat_id, save_prob >= self.valves.MCP_MEMORY_SAVE_THRESHOLD, save_prob
             )
 
+        should_extract_answer = (answer.get("answers") or {}).get(
+            "should_extract_relations"
+        )
+        if should_extract_answer is not None and chat_id:
+            extract_prob = float(should_extract_answer["noul"])
+            self._set_relation_extract_decision(
+                chat_id,
+                extract_prob >= self.valves.RELATION_EXTRACT_THRESHOLD,
+                extract_prob,
+            )
+
         if verdict:
             lines.append(
                 f"System One (Kev) scored this message before you answered: {verdict}. "
@@ -970,6 +1083,16 @@ class Filter:
 
         if self.valves.MEMORY_ENABLED and getattr(user_valves, "memory_enabled", True):
             await self._save_memory_if_worthwhile(
+                body, chat_id, __event_emitter__, user_valves, __user__
+            )
+
+        if (
+            self.valves.MEMORY_ENABLED
+            and self.valves.RELATION_EXTRACT_ENABLED
+            and getattr(user_valves, "memory_enabled", True)
+            and getattr(user_valves, "relation_extract_enabled", True)
+        ):
+            await self._extract_relations_if_worthwhile(
                 body, chat_id, __event_emitter__, user_valves, __user__
             )
 
@@ -1025,6 +1148,64 @@ class Filter:
             await self._status(
                 emitter,
                 f"Memory MCP unavailable ({type(exception).__name__}); message not saved",
+                user_valves,
+            )
+
+    async def _extract_relations_if_worthwhile(
+        self,
+        body: dict,
+        chat_id: Optional[str],
+        emitter,
+        user_valves,
+        user_dict: Optional[dict],
+    ) -> None:
+        """Sends the user's message to the relation_extractor MCP server and saves any
+        resulting subject-relation-object triples to mcp-memory, gated by the matching
+        `inlet` call's should_extract_relations verdict when RELATION_EXTRACT_DETECT is on.
+        Unlike _save_memory_if_worthwhile's fall-back-to-always-save, a missing verdict here
+        skips extraction rather than running it: the L5 neural pass (ReLiK+GLiREL) is
+        materially more expensive than a `remember` call, so it shouldn't run blind just
+        because Kev didn't answer in time."""
+        text = self._last_user_text(body)
+        if len(text) < self.valves.MCP_MEMORY_MIN_CHARS:
+            return
+
+        status_suffix = ""
+        if self.valves.RELATION_EXTRACT_DETECT:
+            decision = self._pop_relation_extract_decision(chat_id) if chat_id else None
+            if decision is None:
+                return
+            should_extract, probability = decision
+            if not should_extract:
+                return
+            status_suffix = f" (Kev p {probability:.3f})"
+
+        try:
+            relations = await self._extract_relations(text)
+        except (
+            Exception
+        ) as exception:  # noqa: BLE001 - fail open: never block the reply on extraction
+            await self._status(
+                emitter,
+                f"Relation extractor unavailable ({type(exception).__name__}); relations not extracted",
+                user_valves,
+            )
+            return
+        if not relations:
+            return
+
+        memory_user_id = self._resolve_memory_user_id(user_dict)
+        saved = 0
+        for relation in relations:
+            try:
+                await self._save_relation(relation, memory_user_id)
+                saved += 1
+            except Exception:  # noqa: BLE001 - one bad save shouldn't drop the rest
+                continue
+        if saved:
+            await self._status(
+                emitter,
+                f"Memory: extracted and saved {saved} relation(s){status_suffix}",
                 user_valves,
             )
 
@@ -1127,6 +1308,36 @@ class Filter:
         if time.monotonic() - created_at >= _SAVE_DECISION_TTL:
             return None
         return should_save, probability
+
+    # -- relation extraction (RELATION_EXTRACT_ENABLED) gating
+
+    @staticmethod
+    def _set_relation_extract_decision(
+        chat_id: str, should_extract: bool, probability: float
+    ) -> None:
+        """Record this turn's Kev should_extract_relations verdict so the matching
+        `outlet` call (same chat, right after the model answers) can act on it."""
+        _CHAT_RELATION_EXTRACT_STORE[chat_id] = (
+            time.monotonic(),
+            should_extract,
+            probability,
+        )
+        _CHAT_RELATION_EXTRACT_STORE.move_to_end(chat_id)
+        while len(_CHAT_RELATION_EXTRACT_STORE) > _RELATION_EXTRACT_MAX_CHATS:
+            _CHAT_RELATION_EXTRACT_STORE.popitem(last=False)
+
+    @staticmethod
+    def _pop_relation_extract_decision(chat_id: str) -> Optional[tuple]:
+        """Consume this turn's should_extract_relations verdict, if Kev answered it in
+        time. Returns None (caller skips extraction this turn) when there is nothing
+        recorded or it aged out before the model finished."""
+        entry = _CHAT_RELATION_EXTRACT_STORE.pop(chat_id, None)
+        if not entry:
+            return None
+        created_at, should_extract, probability = entry
+        if time.monotonic() - created_at >= _RELATION_EXTRACT_TTL:
+            return None
+        return should_extract, probability
 
     # -- logic verification (LOGIC_VERIFY_ENABLED) gating
 
@@ -1576,6 +1787,60 @@ class Filter:
                 arguments["ttl_days"] = None
             else:
                 arguments["ttl_days"] = self.valves.MCP_MEMORY_TTL_DAYS
+        async with _MCPToolClient(
+            self.valves.MCP_MEMORY_URL,
+            self.valves.MCP_MEMORY_SECURITY_KEY,
+            self.valves.MCP_MEMORY_TIMEOUT,
+        ) as mcp:
+            await mcp.call_tool("remember", arguments)
+
+    # -- relation_extractor requests
+
+    async def _extract_relations(self, text: str) -> list[dict]:
+        """Calls the relation_extractor MCP server (other/relation_extractor/
+        z3_backend.py) and returns up to RELATION_EXTRACT_MAX_RELATIONS triples worth
+        saving: L5 neural relations (ReLiK+GLiREL) scoring at least
+        RELATION_EXTRACT_MIN_SCORE, highest-scoring first, falling back to the legacy
+        spaCy/NLTK relations (unscored) only when L5 found nothing at all."""
+        async with _MCPToolClient(
+            self.valves.RELATION_EXTRACTOR_URL,
+            self.valves.RELATION_EXTRACTOR_SECURITY_KEY,
+            self.valves.RELATION_EXTRACTOR_TIMEOUT,
+        ) as mcp:
+            result = await mcp.call_tool("extract_relations_tool", {"sentence": text})
+        if not isinstance(result, dict):
+            return []
+
+        def _valid(r: Any) -> bool:
+            return (
+                isinstance(r, dict)
+                and str(r.get("subject") or "").strip()
+                and str(r.get("relation") or "").strip()
+                and str(r.get("object") or "").strip()
+            )
+
+        relations = [
+            r
+            for r in (result.get("relations") or [])
+            if _valid(r)
+            and float(r.get("score") or 0.0) >= self.valves.RELATION_EXTRACT_MIN_SCORE
+        ]
+        relations.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
+        if not relations:
+            relations = [r for r in (result.get("legacy_relations") or []) if _valid(r)]
+        return relations[: max(0, self.valves.RELATION_EXTRACT_MAX_RELATIONS)]
+
+    async def _save_relation(self, relation: dict, user_id: str) -> None:
+        """Persists one subject-relation-object triple via mcp-memory's `remember` tool,
+        as a short factual sentence, tagged with RELATION_EXTRACT_MEMORY_TYPE so it's
+        distinguishable from the plain-text should_save memories."""
+        text = f"{relation['subject']} {relation['relation']} {relation['object']}"
+        arguments = {
+            "text": text,
+            "user_id": user_id,
+            "type": self.valves.RELATION_EXTRACT_MEMORY_TYPE,
+            "source": self.valves.MCP_MEMORY_SOURCE,
+        }
         async with _MCPToolClient(
             self.valves.MCP_MEMORY_URL,
             self.valves.MCP_MEMORY_SECURITY_KEY,
